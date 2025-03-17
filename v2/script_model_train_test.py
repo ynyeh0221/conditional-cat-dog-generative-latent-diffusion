@@ -1380,12 +1380,18 @@ def main():
 
         # Plot autoencoder loss
         plt.figure(figsize=(8, 5))
-        plt.plot(ae_losses)
-        plt.title('Autoencoder Training Loss')
+        # Plot each loss type separately
+        plt.figure(figsize=(10, 6))
+        plt.plot(ae_losses['total'], label='Total Loss')
+        plt.plot(ae_losses['recon'], label='Reconstruction Loss')
+        plt.plot(ae_losses['class'], label='Classification Loss')
+        plt.plot(ae_losses['center'], label='Center Loss')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
+        plt.title('Autoencoder Training Losses')
+        plt.legend()
         plt.grid(True)
-        plt.savefig(f"{results_dir}/autoencoder_loss.png")
+        plt.savefig(f"{results_dir}/autoencoder_losses.png")
         plt.close()
 
     # Create conditional UNet
