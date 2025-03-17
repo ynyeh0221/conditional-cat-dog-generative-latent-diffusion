@@ -1,2 +1,10 @@
 # CIFAR10-cat-dog-generative-latent-diffusion
 A simple PyTorch implementation of a latent diffusion model for generating CIFAR-10 (cat/dog)-like digit images. The repository demonstrates both unconditional and conditional image generation, clearly showing how diffusion models remove noise step-by-step to generate digits from random noise or from a numeric prompt.
+
+| Model Component | Visualization | Description |
+|-----------------|---------------|-------------|
+| Autoencoder | ![Reconstructions](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v1/output/reconstruction/reconstruction_epoch_100.png) | Original images (top) and their reconstructions (bottom) |
+| Latent Space | ![Latent Space](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v1/output/latent_space/latent_space_epoch_100.png) | t-SNE visualization of cat and dog latent representations |
+| Class Samples | ![Class Samples](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v1/output/diffusion_result_sample/sample_class_Cat_epoch_100.png)![Class Samples](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v1/output/diffusion_result_sample/sample_class_Dog_epoch_100.png) | Generated samples for cat and dog classes |
+| Denoising Process | ![Denoising Cat](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v1/output/denosing_path/denoising_path_Cat_epoch_100.png)![Denoising Dog](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v1/output/denosing_path/denoising_path_Dog_epoch_100.png) | Visualization of cat generation process and latent path |
+| Animation | ![Cat Animation](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v1/diffusion_animation_class_Cat_epoch_100.gif)![Dog Animation](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v1/diffusion_animation_class_Dog_epoch_100.gif) | Animation of the denoising process for cat generation |
