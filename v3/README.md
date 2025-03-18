@@ -105,3 +105,11 @@ The project includes several visualization tools:
 ## Results
 
 After training, the model produces high-quality, diverse cat and dog images with distinctive class features. The denoising visualizations show how the latent space paths move toward the target class regions during the generation process.
+
+| Model Component | Visualization | Description |
+|-----------------|---------------|-------------|
+| Autoencoder | ![Reconstructions](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v3/output/reconstruction/reconstruction_epoch_100.png) | Original images (top) and their reconstructions (bottom) |
+| Latent Space | ![Latent Space](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v3/output/latent_space/latent_space_epoch_100.png) | t-SNE visualization of cat and dog latent representations |
+| Class Samples | ![Class Samples](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v3/output/diffusion_result_sample/sample_class_Cat_epoch_100.png)![Class Samples](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v3/output/diffusion_result_sample/sample_class_Dog_epoch_100.png) | Generated samples for cat and dog classes |
+| Denoising Process | ![Denoising Cat](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v3/output/denoising_path_Cat_final.png)![Denoising Dog](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v3/output/denoising_path_Dog_final.png) | Visualization of cat generation process and latent path |
+| Animation | ![Cat Animation](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v3/diffusion_animation_class_Cat_epoch_100.gif)![Dog Animation](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v3/diffusion_animation_class_Dog_epoch_100.gif) | Animation of the denoising process for cat generation |
