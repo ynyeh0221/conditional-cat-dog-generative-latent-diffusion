@@ -901,7 +901,7 @@ def visualize_denoising_steps(vae, diffusion, class_idx, save_path=None):
         vae: Trained autoencoder model
         diffusion: Trained diffusion model
         class_idx: Target class index (0-1 for cat/dog)
-        save_dir: Directory to save visualizations
+        save_path: Path to save visualization
     """
     device = next(vae.parameters()).device
 
@@ -925,9 +925,22 @@ def visualize_denoising_steps(vae, diffusion, class_idx, save_path=None):
     with torch.no_grad():
         for images, labels in test_loader:
             images = images.to(device)
-            latents = vae.encode(images)
-            # 在这里添加展平操作
-            latents = latents.view(latents.size(0), -1)  # 将 [batch_size, 3, 8, 8] 展平为 [batch_size, 192]
+
+            # Handle encode method that might return multiple values
+            encode_output = vae.encode(images)
+
+            # Extract latent representation based on return type
+            if isinstance(encode_output, tuple):
+                # If encode returns a tuple, first element should be latent representation
+                latents = encode_output[0]
+            else:
+                # If it returns a single tensor
+                latents = encode_output
+
+            # Ensure latents are flattened to 2D for PCA
+            if len(latents.shape) > 2:
+                latents = latents.view(latents.size(0), -1)
+
             all_latents.append(latents.detach().cpu().numpy())
             all_labels.append(labels.numpy())
 
@@ -972,6 +985,10 @@ def visualize_denoising_steps(vae, diffusion, class_idx, save_path=None):
             # Decode to images
             current_x_flat = current_x.view(n_samples, -1)
             decoded = vae.decode(current_x_flat)
+
+            # Handle decoder that might return multiple values
+            if isinstance(decoded, tuple):
+                decoded = decoded[0]  # Take first element as reconstructed image
 
             # Add to samples
             samples_per_step.append(decoded.cpu())
@@ -1499,7 +1516,7 @@ def main():
         # Define train function
         def train_vae(vae, train_loader, num_epochs=150, lr=5e-5,
                       lambda_recon=1.0, lambda_cls=0.5, lambda_center=0.1, lambda_kl=0.05,
-                      visualize_every=5, save_dir="./results"):
+                      visualize_every=1, save_dir="./results"):
             """
             Train VAE with improved hyperparameters and training approach
 
@@ -1800,7 +1817,7 @@ def main():
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
             vae, conditional_unet, num_epochs=100, lr=1e-3,
-            visualize_every=10,  # Visualize every 5 epochs
+            visualize_every=1,  # Visualize every 5 epochs
             save_dir=results_dir
         )
 
@@ -1840,10 +1857,6 @@ def main():
     print("Denoising visualizations:")
     for i, path in enumerate(denoising_paths):
         print(f"  - {class_names[i]}: {path}")
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":
