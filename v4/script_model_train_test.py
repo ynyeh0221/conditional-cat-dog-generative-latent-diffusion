@@ -148,7 +148,7 @@ class Reparameterize(nn.Module):
 
 # Enhanced Encoder with increased capacity - keeping original name VAEEncoder
 class VAEEncoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=256):
+    def __init__(self, in_channels=3, latent_dim=192):
         super().__init__()
 
         # Initial convolution with increased channels
@@ -364,7 +364,7 @@ class CenterLoss(nn.Module):
 
 # Complete VAE model with skip connections - keeping original name
 class VariationalAutoencoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=256, num_classes=2):
+    def __init__(self, in_channels=3, latent_dim=192, num_classes=2):
         super().__init__()
         self.latent_dim = latent_dim
 
@@ -1654,12 +1654,12 @@ def main():
         vae, ae_losses = train_vae(
             vae,
             train_loader,  # Add this parameter
-            num_epochs=150,
+            num_epochs=30,
             lr=1e-4,
-            lambda_cls=1.0,
+            lambda_cls=0.2,
             lambda_center=0.5,
             lambda_kl=0.01,
-            visualize_every=30,
+            visualize_every=15,
             save_dir=results_dir
         )
 
@@ -1706,7 +1706,8 @@ def main():
         conditional_unet.apply(init_weights)
 
         # Define train function
-        def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10, save_dir=results_dir):
+        def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
+                                        save_dir="./results"):
             print("Starting Class-Conditional Diffusion Model training...")
             os.makedirs(save_dir, exist_ok=True)
 
@@ -1731,9 +1732,29 @@ def main():
 
                     # Encode images to latent space
                     with torch.no_grad():
-                        latents = autoencoder.encode(data)
-                        # Reshape latents to spatial form [B, 3, 8, 8]
-                        latents = latents.view(-1, 3, 8, 8)  # 3 channels for RGB
+                        # Handle the encode method which might return multiple values
+                        encode_output = autoencoder.encode(data)
+
+                        # Extract latent representation from tuple
+                        if isinstance(encode_output, tuple):
+                            latents = encode_output[0]  # Get the first element (latent z)
+                        else:
+                            latents = encode_output
+
+                        # Reshape latents to spatial form if needed
+                        if len(latents.shape) == 2:  # If latents is [B, latent_dim]
+                            # Assuming a 256-dim latent vector needs to be reshaped to 3D for diffusion
+                            # This is an approximation - adjust according to your diffusion model's expectations
+                            latent_dim = latents.shape[1]
+                            spatial_size = int((latent_dim / 3) ** 0.5)  # Calculate spatial dimension
+
+                            if spatial_size ** 2 * 3 == latent_dim:  # If perfect square
+                                latents = latents.view(-1, 3, spatial_size, spatial_size)
+                            else:
+                                # If not a perfect fit, use a different approach or fixed size
+                                print(f"Warning: Latent dim {latent_dim} can't be reshaped perfectly to 3D")
+                                # For example, reshape to fixed 8x8 and use only part of the latent
+                                latents = latents[:, :192].view(-1, 3, 8, 8)  # Use first 192 dimensions
 
                     # Calculate diffusion loss with class conditioning
                     loss = diffusion.loss(latents, labels)
@@ -1758,12 +1779,18 @@ def main():
                 if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
                     # Generate samples for both classes
                     for class_idx in range(len(class_names)):
-                        create_diffusion_animation(autoencoder, diffusion, class_idx=class_idx, num_frames=50,
-                                                   save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif")
+                        create_diffusion_animation(
+                            autoencoder, diffusion, class_idx=class_idx, num_frames=50,
+                            save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif"
+                        )
                         save_path = f"{save_dir}/sample_class_{class_names[class_idx]}_epoch_{epoch + 1}.png"
-                        generate_class_samples(autoencoder, diffusion, target_class=class_idx, num_samples=5, save_path=save_path)
+                        generate_class_samples(
+                            autoencoder, diffusion, target_class=class_idx, num_samples=5, save_path=save_path
+                        )
                         save_path = f"{save_dir}/denoising_path_{class_names[class_idx]}_epoch_{epoch + 1}.png"
-                        visualize_denoising_steps(autoencoder, diffusion, class_idx=class_idx, save_path=save_path)
+                        visualize_denoising_steps(
+                            autoencoder, diffusion, class_idx=class_idx, save_path=save_path
+                        )
 
                     # Save checkpoint
                     torch.save(unet.state_dict(), f"{save_dir}/conditional_diffusion_epoch_{epoch + 1}.pt")
@@ -1773,7 +1800,7 @@ def main():
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
             vae, conditional_unet, num_epochs=100, lr=1e-3,
-            visualize_every=5,  # Visualize every 5 epochs
+            visualize_every=10,  # Visualize every 5 epochs
             save_dir=results_dir
         )
 
@@ -1813,6 +1840,10 @@ def main():
     print("Denoising visualizations:")
     for i, path in enumerate(denoising_paths):
         print(f"  - {class_names[i]}: {path}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
