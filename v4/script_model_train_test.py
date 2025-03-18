@@ -27,7 +27,7 @@ transform = transforms.Compose([
 ])
 
 # Batch size for training
-batch_size = 256
+batch_size = 512
 
 # Define class names for CIFAR cats and dogs
 class_names = ['Cat', 'Dog']
@@ -69,60 +69,6 @@ def create_cat_dog_dataset(cifar_dataset):
 
 # Channel Attention Layer for improved feature selection
 class CALayer(nn.Module):
-    def __init__(self, channel, reduction=16, bias=False):
-        super(CALayer, self).__init__()
-        # Global average pooling: feature --> point
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        # Feature channel downscale and upscale --> channel weight
-        self.conv_du = nn.Sequential(
-            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=bias),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=bias),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        y = self.avg_pool(x)
-        y = self.conv_du(y)
-        return x * y
-
-
-# Complete Autoencoder model with RGB latent space
-# Center Loss implementation
-class CenterLoss(nn.Module):
-    def __init__(self, num_classes=2, feat_dim=192):
-        super(CenterLoss, self).__init__()
-        self.num_classes = num_classes
-        self.feat_dim = feat_dim
-        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim))
-
-    def forward(self, x, labels):
-        batch_size = x.size(0)
-
-        # Apply L2 normalization to features and centers
-        x_norm = F.normalize(x, p=2, dim=1)  # L2 normalization
-        centers_norm = F.normalize(self.centers, p=2, dim=1)
-
-        # Calculate distance matrix using normalized vectors
-        distmat = torch.pow(x_norm, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
-                  torch.pow(centers_norm, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
-
-        # Use updated addmm_ syntax with normalized vectors
-        distmat.addmm_(x_norm, centers_norm.t(), beta=1, alpha=-2)
-
-        # Get class mask
-        classes = torch.arange(self.num_classes).to(labels.device)
-        labels = labels.unsqueeze(1).expand(batch_size, self.num_classes)
-        mask = labels.eq(classes.expand(batch_size, self.num_classes))
-
-        # Apply mask and calculate loss
-        dist = distmat * mask.float()
-        loss = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
-
-        return loss
-
-
-class CALayer(nn.Module):
     def __init__(self, channel, reduction=8, bias=False):
         super(CALayer, self).__init__()
         # Global average pooling
@@ -153,7 +99,7 @@ class CALayer(nn.Module):
         return x * y
 
 
-# Enhanced Convolutional Attention Block
+# Convolutional Attention Block - keeping the original name
 class CAB(nn.Module):
     def __init__(self, n_feat, reduction=8, bias=False):
         super(CAB, self).__init__()
@@ -184,133 +130,7 @@ class CAB(nn.Module):
         return out
 
 
-# Enhanced Encoder
-class VAEEncoder(nn.Module):
-    def __init__(self, in_channels=3):
-        super().__init__()
-
-        # Initial convolution with batch norm
-        self.initial = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-
-        # First downsampling block
-        self.down1 = nn.Sequential(
-            nn.Conv2d(32, 64, 4, stride=2, padding=1),  # 32x32 -> 16x16
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(64, reduction=8)
-        )
-
-        # Second downsampling block
-        self.down2 = nn.Sequential(
-            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # 16x16 -> 8x8
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(128, reduction=8),
-            CAB(128, reduction=8)
-        )
-
-        # Branch for class features
-        self.class_branch = nn.Sequential(
-            nn.Conv2d(128, 64, 3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 1, 1)  # 1 channel for class features
-        )
-
-        # Branch for mean
-        self.mu_branch = nn.Sequential(
-            nn.Conv2d(128, 64, 3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 1, 1)  # 1 channel for mu
-        )
-
-        # Branch for log variance
-        self.logvar_branch = nn.Sequential(
-            nn.Conv2d(128, 64, 3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 1, 1)  # 1 channel for logvar
-        )
-
-        # Reparameterization module
-        self.reparameterize = Reparameterize()
-
-    def forward(self, x):
-        # Initial features
-        x = self.initial(x)
-
-        # Downsample
-        x = self.down1(x)
-        features = self.down2(x)
-
-        # Generate latent representation
-        class_features = self.class_branch(features)
-        mu = self.mu_branch(features)
-        logvar = self.logvar_branch(features)
-
-        # Apply reparameterization
-        z = self.reparameterize(mu, logvar)
-
-        # Concatenate to form complete latent representation
-        return torch.cat([class_features, mu, z], dim=1), mu, logvar
-
-
-# Enhanced Decoder
-class Decoder(nn.Module):
-    def __init__(self, out_channels=3):
-        super().__init__()
-
-        # Initial convolution to process latent space
-        self.initial = nn.Sequential(
-            nn.Conv2d(3, 128, 3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(128, reduction=8)
-        )
-
-        # First upsampling block: 8x8 -> 16x16
-        self.up1 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(64, reduction=8)
-        )
-
-        # Second upsampling block: 16x16 -> 32x32
-        self.up2 = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
-            nn.BatchNorm2d(32),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(32, reduction=8)
-        )
-
-        # Final output layer with tanh for better contrast
-        self.final = nn.Sequential(
-            nn.Conv2d(32, out_channels, 3, padding=1),
-            nn.Tanh()  # Use tanh instead of sigmoid for better contrast
-        )
-
-    def forward(self, z):
-        # Process latent representation
-        x = self.initial(z)
-
-        # Upsample
-        x = self.up1(x)
-        x = self.up2(x)
-
-        # Generate final output
-        x = self.final(x)
-
-        # Rescale from [-1,1] to [0,1] range
-        return (x + 1) / 2
-
-
-# Reparameterization class
+# Reparameterization module - keeping original name
 class Reparameterize(nn.Module):
     def __init__(self):
         super().__init__()
@@ -326,60 +146,275 @@ class Reparameterize(nn.Module):
             return mu
 
 
-# Enhanced VAE
-class VariationalAutoencoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=None, num_classes=2):
+# Enhanced Encoder with increased capacity - keeping original name VAEEncoder
+class VAEEncoder(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=256):
         super().__init__()
-        self.encoder = VAEEncoder(in_channels)
-        self.decoder = Decoder(in_channels)
 
-        # Latent dimension remains the same
-        self.latent_dim = 3 * 8 * 8
+        # Initial convolution with increased channels
+        self.initial = nn.Sequential(
+            nn.Conv2d(in_channels, 64, 3, stride=1, padding=1),  # Increased from 32
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
 
-        # Improved classifier with dropout for better generalization
-        self.classifier = nn.Sequential(
-            nn.Linear(self.latent_dim, 256),
+        # First downsampling block with more channels
+        self.down1 = nn.Sequential(
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # 32x32 -> 16x16
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(128, reduction=8)
+        )
+
+        # Second downsampling block with more channels
+        self.down2 = nn.Sequential(
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),  # 16x16 -> 8x8
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(256, reduction=8),
+            CAB(256, reduction=8)
+        )
+
+        # New: Third downsampling block for deeper feature extraction
+        self.down3 = nn.Sequential(
+            nn.Conv2d(256, 512, 4, stride=2, padding=1),  # 8x8 -> 4x4
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(512, reduction=8)
+        )
+
+        # Flatten layer for converting spatial features to vector
+        self.flatten = nn.Flatten()
+
+        # Latent space mapping (traditional design instead of RGB latent space)
+        self.fc_mu = nn.Linear(512 * 4 * 4, latent_dim)
+        self.fc_logvar = nn.Linear(512 * 4 * 4, latent_dim)
+
+        # Class features branch
+        self.class_branch = nn.Sequential(
+            nn.Linear(512 * 4 * 4, 256),
             nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.4),  # Increased dropout
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3)
+        )
 
+        # Reparameterization module
+        self.reparameterize = Reparameterize()
+
+    def forward(self, x):
+        # Save intermediate feature maps for skip connections
+        x1 = self.initial(x)  # 64 x 32 x 32
+        x2 = self.down1(x1)  # 128 x 16 x 16
+        x3 = self.down2(x2)  # 256 x 8 x 8
+        x4 = self.down3(x3)  # 512 x 4 x 4
+
+        # Flatten features
+        x_flat = self.flatten(x4)  # B x (512*4*4)
+
+        # Generate latent representation parameters
+        mu = self.fc_mu(x_flat)  # B x latent_dim
+        logvar = self.fc_logvar(x_flat)  # B x latent_dim
+
+        # Class features
+        class_features = self.class_branch(x_flat)  # B x 256
+
+        # Apply reparameterization
+        z = self.reparameterize(mu, logvar)  # B x latent_dim
+
+        # Return all necessary outputs including skip features
+        return z, mu, logvar, class_features, (x1, x2, x3, x4)
+
+
+# Enhanced Decoder with skip connections - keeping original name
+class Decoder(nn.Module):
+    def __init__(self, latent_dim=256, out_channels=3):
+        super().__init__()
+
+        # Project from latent space to spatial features
+        self.latent_proj = nn.Sequential(
+            nn.Linear(latent_dim, 512 * 4 * 4),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        # Initial processing
+        self.initial = nn.Sequential(
+            nn.Conv2d(512, 512, 3, stride=1, padding=1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(512, reduction=8)
+        )
+
+        # First upsampling block: 4x4 -> 8x8
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(256, reduction=8)
+        )
+
+        # Note: skip_connections[3] has shape [B, 512, 4, 4]
+        # Fusion layer after first skip connection
+        self.fusion1 = nn.Sequential(
+            nn.Conv2d(256 + 256, 256, 3, padding=1),  # 256 (up1) + 256 (skip[2]) = 512 channels
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        # Second upsampling block: 8x8 -> 16x16
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(128, reduction=8)
+        )
+
+        # Fusion layer after second skip connection
+        self.fusion2 = nn.Sequential(
+            nn.Conv2d(128 + 128, 128, 3, padding=1),  # 128 (up2) + 128 (skip[1]) = 256 channels
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        # Third upsampling block: 16x16 -> 32x32
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(64, reduction=8)
+        )
+
+        # Fusion layer after third skip connection
+        self.fusion3 = nn.Sequential(
+            nn.Conv2d(64 + 64, 64, 3, padding=1),  # 64 (up3) + 64 (skip[0]) = 128 channels
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        # Final output layer
+        self.final = nn.Sequential(
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(32, out_channels, 3, padding=1),
+            nn.Sigmoid()  # Use Sigmoid instead of Tanh, directly outputs [0,1] range
+        )
+
+    def forward(self, z, skip_connections=None):
+        # Reconstruct initial feature map from latent vector
+        x = self.latent_proj(z)
+        x = x.view(-1, 512, 4, 4)
+        x = self.initial(x)
+
+        # First upsampling: 4x4 -> 8x8
+        x = self.up1(x)
+        if skip_connections is not None:
+            # Skip connection indexing needs to match the spatial dimensions
+            # skip_connections = (x1:32x32, x2:16x16, x3:8x8, x4:4x4)
+            x = torch.cat([x, skip_connections[2]], dim=1)  # Connect 8x8 features
+            x = self.fusion1(x)
+
+        # Second upsampling: 8x8 -> 16x16
+        x = self.up2(x)
+        if skip_connections is not None:
+            x = torch.cat([x, skip_connections[1]], dim=1)  # Connect 16x16 features
+            x = self.fusion2(x)
+
+        # Third upsampling: 16x16 -> 32x32
+        x = self.up3(x)
+        if skip_connections is not None:
+            x = torch.cat([x, skip_connections[0]], dim=1)  # Connect 32x32 features
+            x = self.fusion3(x)
+
+        # Final output
+        return self.final(x)
+
+
+# Center Loss implementation - keeping original name
+class CenterLoss(nn.Module):
+    def __init__(self, num_classes=2, feat_dim=256):
+        super(CenterLoss, self).__init__()
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim))
+
+    def forward(self, x, labels):
+        batch_size = x.size(0)
+
+        # Apply L2 normalization
+        x_norm = F.normalize(x, p=2, dim=1)
+        centers_norm = F.normalize(self.centers, p=2, dim=1)
+
+        # Calculate distance matrix
+        distmat = torch.pow(x_norm, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
+                  torch.pow(centers_norm, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
+
+        # Use updated addmm_ syntax
+        distmat.addmm_(x_norm, centers_norm.t(), beta=1, alpha=-2)
+
+        # Get class mask
+        classes = torch.arange(self.num_classes).to(labels.device)
+        labels = labels.unsqueeze(1).expand(batch_size, self.num_classes)
+        mask = labels.eq(classes.expand(batch_size, self.num_classes))
+
+        # Apply mask and calculate loss
+        dist = distmat * mask.float()
+        loss = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
+
+        return loss
+
+
+# Complete VAE model with skip connections - keeping original name
+class VariationalAutoencoder(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=256, num_classes=2):
+        super().__init__()
+        self.latent_dim = latent_dim
+
+        # Encoder and decoder
+        self.encoder = VAEEncoder(in_channels, latent_dim)
+        self.decoder = Decoder(latent_dim, in_channels)
+
+        # Classifier for class features
+        self.classifier = nn.Sequential(
             nn.Linear(256, 128),
             nn.BatchNorm1d(128),
             nn.LeakyReLU(0.2),
+            nn.Dropout(0.4),
+
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(0.2),
             nn.Dropout(0.3),
 
-            nn.Linear(128, num_classes)
+            nn.Linear(64, num_classes)
         )
 
         # Center loss for better clustering
-        self.center_loss = CenterLoss(num_classes=num_classes, feat_dim=self.latent_dim)
-
-        if latent_dim is not None:
-            print(f"Warning: latent_dim={latent_dim} parameter is ignored in RGB latent space model")
+        self.center_loss = CenterLoss(num_classes=num_classes, feat_dim=256)
 
     def encode(self, x):
-        z, _, _ = self.encoder(x)
-        return z
+        z, mu, logvar, class_features, _ = self.encoder(x)
+        return z, class_features
 
-    def decode(self, z):
-        if len(z.shape) == 2:
-            batch_size = z.shape[0]
-            z = z.view(batch_size, 3, 8, 8)
-        return self.decoder(z)
+    def decode(self, z, skip_connections=None):
+        return self.decoder(z, skip_connections)
 
-    def classify(self, z_flat):
-        return self.classifier(z_flat)
+    def classify(self, class_features):
+        return self.classifier(class_features)
 
-    def compute_center_loss(self, z_flat, labels):
-        return self.center_loss(z_flat, labels)
+    def compute_center_loss(self, class_features, labels):
+        return self.center_loss(class_features, labels)
 
     def get_latent_params(self, x):
-        _, mu, logvar = self.encoder(x)
+        _, mu, logvar, _, _ = self.encoder(x)
         return mu, logvar
 
     def forward(self, x):
-        z, _, _ = self.encoder(x)
-        return self.decoder(z)
+        # Encode input
+        z, mu, logvar, class_features, skip_connections = self.encoder(x)
+
+        # Decode with skip connections
+        reconstructed = self.decoder(z, skip_connections)
+
+        return reconstructed, z, mu, logvar, class_features
 
     def compute_kl_loss(self, mu, logvar):
         # Compute KL divergence loss with numerical stability
@@ -397,8 +432,8 @@ def euclidean_distance_loss(x, y, reduction='mean', spectral_weight=0.1):
     Enhanced Euclidean distance loss with spectral component for better detail preservation.
 
     Args:
-        x: First tensor
-        y: Second tensor
+        x: First tensor (reconstructed image)
+        y: Second tensor (original image)
         reduction: 'mean', 'sum', or 'none'
         spectral_weight: Weight of the spectral component
 
@@ -410,19 +445,37 @@ def euclidean_distance_loss(x, y, reduction='mean', spectral_weight=0.1):
     squared_dist = squared_diff.view(x.size(0), -1).sum(dim=1)
     euclidean_dist = torch.sqrt(squared_dist + 1e-8)  # Add small epsilon for numerical stability
 
-    # Add spectral component to preserve details
+    # Add perceptual component using MSE with SSIM (structural similarity)
     if spectral_weight > 0:
-        # Use FFT to compute frequency domain representation
-        x_fft = torch.fft.fft2(x)
-        y_fft = torch.fft.fft2(y)
+        # Simple structure similarity component
+        def ssim_component(x, y, window_size=11):
+            C1 = 0.01 ** 2
+            C2 = 0.03 ** 2
 
-        # Compute magnitude difference in frequency domain
-        x_mag = torch.abs(x_fft)
-        y_mag = torch.abs(y_fft)
-        fft_dist = F.mse_loss(x_mag, y_mag, reduction='none').view(x.size(0), -1).sum(dim=1)
+            # Calculate means
+            mu_x = F.avg_pool2d(x, window_size, stride=1, padding=window_size // 2)
+            mu_y = F.avg_pool2d(y, window_size, stride=1, padding=window_size // 2)
 
-        # Combine spatial and spectral distances
-        combined_dist = euclidean_dist + spectral_weight * fft_dist
+            mu_x_sq = mu_x.pow(2)
+            mu_y_sq = mu_y.pow(2)
+            mu_xy = mu_x * mu_y
+
+            # Calculate variances and covariance
+            sigma_x_sq = F.avg_pool2d(x.pow(2), window_size, stride=1, padding=window_size // 2) - mu_x_sq
+            sigma_y_sq = F.avg_pool2d(y.pow(2), window_size, stride=1, padding=window_size // 2) - mu_y_sq
+            sigma_xy = F.avg_pool2d(x * y, window_size, stride=1, padding=window_size // 2) - mu_xy
+
+            # SSIM formula
+            ssim_map = ((2 * mu_xy + C1) * (2 * sigma_xy + C2)) / \
+                       ((mu_x_sq + mu_y_sq + C1) * (sigma_x_sq + sigma_y_sq + C2))
+
+            return 1 - ssim_map.mean(dim=1).mean(dim=1).mean(dim=1)
+
+        # Calculate SSIM loss
+        perceptual_dist = ssim_component(x, y)
+
+        # Combine distances
+        combined_dist = euclidean_dist + spectral_weight * perceptual_dist
     else:
         combined_dist = euclidean_dist
 
@@ -715,23 +768,25 @@ class ConditionalDenoiseDiffusion():
         alpha_bar_t = self.alpha_bar[t].reshape(-1, 1, 1, 1)
         return torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * eps
 
-    def p_sample(self, xt, t, c=None):
-        """Single denoising step with optional class conditioning"""
+    def p_sample(self, xt, t, c=None, guidance_scale=3.0):
+        """Single denoising step with enhanced classifier guidance"""
         # Convert time to tensor format expected by model
         if not isinstance(t, torch.Tensor):
             t = torch.tensor([t], device=xt.device)
 
-        # Predict noise (with class conditioning if provided)
-        eps_theta = self.eps_model(xt, t, c)
+        eps_uncond = self.eps_model(xt, t, None)
 
-        # Get alpha values
+        if c is not None:
+            eps_cond = self.eps_model(xt, t, c)
+            eps_theta = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+        else:
+            eps_theta = eps_uncond
+
         alpha_t = self.alpha[t].reshape(-1, 1, 1, 1)
         alpha_bar_t = self.alpha_bar[t].reshape(-1, 1, 1, 1)
 
-        # Calculate mean
         mean = (xt - (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t) * eps_theta) / torch.sqrt(alpha_t)
 
-        # Add noise if not the final step
         var = self.beta[t].reshape(-1, 1, 1, 1)
 
         if t[0] > 0:
@@ -740,14 +795,12 @@ class ConditionalDenoiseDiffusion():
         else:
             return mean
 
-    def sample(self, shape, device, c=None):
-        """Generate samples by denoising from pure noise with optional class conditioning"""
-        # Start from pure noise
+    def sample(self, shape, device, c=None, guidance_scale=3.0):
+        """Generate samples with enhanced classifier guidance"""
         x = torch.randn(shape, device=device)
 
-        # Progressively denoise with class conditioning
         for t in tqdm(reversed(range(self.n_steps)), desc="Sampling"):
-            x = self.p_sample(x, t, c)
+            x = self.p_sample(x, t, c, guidance_scale=guidance_scale)
 
         return x
 
@@ -1082,13 +1135,9 @@ def visualize_denoising_steps(vae, diffusion, class_idx, save_path=None):
     return save_path
 
 
-# Visualization functions that were missing
-
 # Visualize autoencoder reconstructions
 def visualize_reconstructions(vae, epoch, save_dir="./results"):
     """Visualize original and reconstructed images at each epoch"""
-    import matplotlib.pyplot as plt
-    import os
 
     os.makedirs(save_dir, exist_ok=True)
     device = next(vae.parameters()).device
@@ -1104,22 +1153,31 @@ def visualize_reconstructions(vae, epoch, save_dir="./results"):
     # Generate reconstructions
     vae.eval()
     with torch.no_grad():
-        reconstructed = vae(test_images)
+        # Handle the updated model structure which might return multiple values
+        reconstructed_output = vae(test_images)
+
+        # Check what the model returns and extract reconstructed images
+        if isinstance(reconstructed_output, tuple):
+            # If the forward method returns a tuple, the first element should be reconstructions
+            reconstructed = reconstructed_output[0]
+        else:
+            # If it returns a single tensor
+            reconstructed = reconstructed_output
 
     # Create visualization
     fig, axes = plt.subplots(2, 8, figsize=(16, 4))
 
     for i in range(8):
-        # Original image - handle normalization if applied in transform
+        # Original image
         img = test_images[i].cpu().permute(1, 2, 0).numpy()
-        img = np.clip(img, 0, 1)  # Ensure display range is [0,1]
+        img = np.clip(img, 0, 1)
         axes[0, i].imshow(img)
         axes[0, i].set_title(f'Original: {class_names[test_labels[i]]}')
         axes[0, i].axis('off')
 
-        # Reconstruction - already in [0,1] range from decoder
+        # Reconstruction
         recon_img = reconstructed[i].cpu().permute(1, 2, 0).numpy()
-        recon_img = np.clip(recon_img, 0, 1)  # Ensure display range is [0,1]
+        recon_img = np.clip(recon_img, 0, 1)
         axes[1, i].imshow(recon_img)
         axes[1, i].set_title('Reconstruction')
         axes[1, i].axis('off')
@@ -1128,7 +1186,6 @@ def visualize_reconstructions(vae, epoch, save_dir="./results"):
     plt.savefig(f"{save_dir}/reconstruction_epoch_{epoch}.png")
     plt.close()
     vae.train()
-
 
 # Visualize latent space with t-SNE
 def visualize_latent_space(vae, epoch, save_dir="./results"):
@@ -1149,9 +1206,22 @@ def visualize_latent_space(vae, epoch, save_dir="./results"):
     with torch.no_grad():
         for images, labels in test_loader:
             images = images.to(device)
-            latents = vae.encode(images)
-            # Flatten the latent space from [batch_size, 3, 8, 8] to [batch_size, 192]
-            latents = latents.view(latents.size(0), -1)
+
+            # Handle the encode method which might return multiple values
+            encode_output = vae.encode(images)
+
+            # Check what the encode method returns and extract latent features
+            if isinstance(encode_output, tuple):
+                # If the encode method returns a tuple, the first element should be the latent representation
+                latents = encode_output[0]
+            else:
+                # If it returns a single tensor
+                latents = encode_output
+
+            # Ensure latents is flattened to 2D for t-SNE
+            if len(latents.shape) > 2:
+                latents = latents.view(latents.size(0), -1)
+
             all_latents.append(latents.cpu().numpy())
             all_labels.append(labels.numpy())
 
@@ -1428,7 +1498,7 @@ def main():
 
         # Define train function
         def train_vae(vae, train_loader, num_epochs=150, lr=5e-5,
-                      lambda_cls=1.0, lambda_center=0.5, lambda_kl=0.05,
+                      lambda_recon=1.0, lambda_cls=0.5, lambda_center=0.1, lambda_kl=0.05,
                       visualize_every=5, save_dir="./results"):
             """
             Train VAE with improved hyperparameters and training approach
@@ -1438,9 +1508,10 @@ def main():
                 train_loader: DataLoader for training data
                 num_epochs: Number of training epochs
                 lr: Learning rate
-                lambda_cls: Weight for classification loss
-                lambda_center: Weight for center loss
-                lambda_kl: Weight for KL divergence loss
+                lambda_recon: Weight for reconstruction loss (increased)
+                lambda_cls: Weight for classification loss (reduced)
+                lambda_center: Weight for center loss (reduced)
+                lambda_kl: Weight for KL divergence loss (reduced)
                 visualize_every: Epoch interval for visualization
                 save_dir: Directory to save results
 
@@ -1448,24 +1519,26 @@ def main():
                 Trained VAE and loss history
             """
             print("Starting enhanced VAE training...")
+            import os
             os.makedirs(save_dir, exist_ok=True)
             device = next(vae.parameters()).device
 
-            # Use AMSGrad variant of Adam for better stability
-            optimizer = torch.optim.Adam(vae.parameters(), lr=lr, betas=(0.9, 0.999),
-                                         eps=1e-8, weight_decay=1e-6, amsgrad=True)
+            # Use AdamW optimizer with improved parameters
+            optimizer = torch.optim.AdamW(vae.parameters(), lr=lr, betas=(0.9, 0.999),
+                                          eps=1e-8, weight_decay=1e-6)
 
-            # Learning rate scheduler
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
+            # Cosine annealing learning rate scheduler
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=10, T_mult=2, eta_min=1e-6
             )
 
             # Initialize loss history
             loss_history = {'total': [], 'recon': [], 'class': [], 'center': [], 'kl': []}
 
-            # Initialize mixed precision training if available
-            scaler = GradScaler() if torch.cuda.is_available() else None
+            # Mixed precision training setup if available
             use_amp = torch.cuda.is_available()
+            if use_amp:
+                scaler = torch.cuda.amp.GradScaler()
 
             for epoch in range(num_epochs):
                 vae.train()
@@ -1475,48 +1548,41 @@ def main():
                 epoch_kl_loss = 0
                 epoch_total_loss = 0
 
-                # KL annealing - gradually increase from 0.01*lambda_kl to lambda_kl
-                if epoch < num_epochs // 4:
-                    kl_weight = lambda_kl * (0.01 + 0.99 * (epoch / (num_epochs // 4)))
+                # Cyclical KL annealing
+                cycle_size = num_epochs // 4
+                cycle_position = epoch % cycle_size
+                if cycle_position < cycle_size // 2:
+                    # Linear increase in first half of cycle
+                    kl_weight = lambda_kl * (0.1 + 0.9 * (cycle_position / (cycle_size // 2)))
                 else:
+                    # Constant in second half of cycle
                     kl_weight = lambda_kl
 
-                # Cycle through batches
-                for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
+                # Training loop
+                for batch_idx, (data, labels) in enumerate(train_loader):
                     data = data.to(device)
                     labels = labels.to(device)
 
                     optimizer.zero_grad()
 
-                    # Forward pass with optional mixed precision
+                    # Forward pass with mixed precision if available
                     if use_amp:
-                        with autocast():
-                            # Forward pass through encoder
-                            z, mu, logvar = vae.encoder(data)
+                        with torch.cuda.amp.autocast():
+                            # Forward pass
+                            reconstructed, z, mu, logvar, class_features = vae(data)
 
-                            # Generate reconstruction
-                            reconstructed = vae.decoder(z)
-
-                            # Enhanced reconstruction loss
-                            recon_loss = euclidean_distance_loss(reconstructed, data, spectral_weight=0.1)
-
-                            # KL divergence loss
+                            # Calculate losses
+                            recon_loss = euclidean_distance_loss(reconstructed, data, spectral_weight=0.2)
                             kl_loss = vae.compute_kl_loss(mu, logvar)
-
-                            # Flatten latent for classification
-                            z_flat = z.view(z.size(0), -1)
-
-                            # Classification loss
-                            class_logits = vae.classify(z_flat)
+                            class_logits = vae.classify(class_features)
                             class_loss = F.cross_entropy(class_logits, labels)
+                            center_loss = vae.compute_center_loss(class_features, labels)
 
-                            # Center loss for better clustering
-                            center_loss = vae.compute_center_loss(z_flat, labels)
+                            # Combined loss with improved weighting
+                            total_loss = lambda_recon * recon_loss + kl_weight * kl_loss + \
+                                         lambda_cls * class_loss + lambda_center * center_loss
 
-                            # Combined loss with annealed KL weight
-                            total_loss = recon_loss + kl_weight * kl_loss + lambda_cls * class_loss + lambda_center * center_loss
-
-                        # Backward pass with mixed precision
+                        # Backward and optimize with mixed precision
                         scaler.scale(total_loss).backward()
                         scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=1.0)
@@ -1524,32 +1590,21 @@ def main():
                         scaler.update()
                     else:
                         # Standard precision training
-                        # Forward pass through encoder
-                        z, mu, logvar = vae.encoder(data)
+                        # Forward pass
+                        reconstructed, z, mu, logvar, class_features = vae(data)
 
-                        # Generate reconstruction
-                        reconstructed = vae.decoder(z)
-
-                        # Enhanced reconstruction loss
-                        recon_loss = euclidean_distance_loss(reconstructed, data, spectral_weight=0.1)
-
-                        # KL divergence loss
+                        # Calculate losses
+                        recon_loss = euclidean_distance_loss(reconstructed, data, spectral_weight=0.2)
                         kl_loss = vae.compute_kl_loss(mu, logvar)
-
-                        # Flatten latent for classification
-                        z_flat = z.view(z.size(0), -1)
-
-                        # Classification loss
-                        class_logits = vae.classify(z_flat)
+                        class_logits = vae.classify(class_features)
                         class_loss = F.cross_entropy(class_logits, labels)
+                        center_loss = vae.compute_center_loss(class_features, labels)
 
-                        # Center loss for better clustering
-                        center_loss = vae.compute_center_loss(z_flat, labels)
+                        # Combined loss with improved weighting
+                        total_loss = lambda_recon * recon_loss + kl_weight * kl_loss + \
+                                     lambda_cls * class_loss + lambda_center * center_loss
 
-                        # Combined loss with annealed KL weight
-                        total_loss = recon_loss + kl_weight * kl_loss + lambda_cls * class_loss + lambda_center * center_loss
-
-                        # Standard backward pass
+                        # Backward and optimize
                         total_loss.backward()
                         torch.nn.utils.clip_grad_norm_(vae.parameters(), max_norm=1.0)
                         optimizer.step()
@@ -1560,6 +1615,9 @@ def main():
                     epoch_center_loss += center_loss.item()
                     epoch_kl_loss += kl_loss.item()
                     epoch_total_loss += total_loss.item()
+
+                # Update learning rate
+                scheduler.step()
 
                 # Calculate average losses
                 num_batches = len(train_loader)
@@ -1584,10 +1642,7 @@ def main():
                 loss_history['kl'].append(avg_kl_loss)
                 loss_history['total'].append(avg_total_loss)
 
-                # Update learning rate
-                scheduler.step(avg_total_loss)
-
-                # Visualization and checkpointing
+                # Perform visualization and save checkpoints
                 if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
                     visualize_reconstructions(vae, epoch + 1, save_dir)
                     visualize_latent_space(vae, epoch + 1, save_dir)
@@ -1599,12 +1654,12 @@ def main():
         vae, ae_losses = train_vae(
             vae,
             train_loader,  # Add this parameter
-            num_epochs=100,
+            num_epochs=150,
             lr=1e-4,
-            lambda_cls=5.0,
-            lambda_center=2.0,
-            lambda_kl=0.1,
-            visualize_every=5,
+            lambda_cls=1.0,
+            lambda_center=0.5,
+            lambda_kl=0.01,
+            visualize_every=30,
             save_dir=results_dir
         )
 
