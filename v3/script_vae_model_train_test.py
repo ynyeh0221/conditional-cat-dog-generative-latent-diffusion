@@ -208,22 +208,18 @@ class Reparameterize(nn.Module):
         super().__init__()
 
     def forward(self, mu, logvar):
-        # 训练时使用reparameterization trick
         if self.training:
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             return mu + eps * std
         else:
-            # 测试时直接返回均值
             return mu
 
 
-# 修改Encoder网络以输出均值和对数方差
 class VAEEncoder(nn.Module):
     def __init__(self, in_channels=3):
         super().__init__()
 
-        # 共享主干网络
         self.backbone = nn.Sequential(
             nn.Conv2d(in_channels, 16, 3, stride=1, padding=1),
             CAB(16, reduction=8),
@@ -236,7 +232,6 @@ class VAEEncoder(nn.Module):
             nn.Conv2d(64, 128, 4, stride=2, padding=1),  # 16x16 -> 8x8
         )
 
-        # 类特征路径
         self.class_branch = nn.Sequential(
             nn.Conv2d(128, 64, 3, stride=1, padding=1),
             nn.BatchNorm2d(64),
@@ -244,14 +239,12 @@ class VAEEncoder(nn.Module):
             nn.Conv2d(64, 1, 1)  # 1 channel for class features
         )
 
-        # 均值路径
         self.mu_branch = nn.Sequential(
             nn.Conv2d(128, 64, 3, stride=1, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 1, 1)  # 1 channel for mu
         )
 
-        # 对数方差路径
         self.logvar_branch = nn.Sequential(
             nn.Conv2d(128, 64, 3, stride=1, padding=1),
             nn.ReLU(inplace=True),
@@ -763,7 +756,6 @@ def visualize_denoising_steps(vae, diffusion, class_idx, save_path=None):
         for images, labels in test_loader:
             images = images.to(device)
             latents = vae.encode(images)
-            # 在这里添加展平操作
             latents = latents.view(latents.size(0), -1)  # 将 [batch_size, 3, 8, 8] 展平为 [batch_size, 192]
             all_latents.append(latents.detach().cpu().numpy())
             all_labels.append(labels.numpy())
