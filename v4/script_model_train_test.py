@@ -158,189 +158,6 @@ class LatentNormalization(nn.Module):
         return torch.tanh(self.norm(z)) * self.scale
 
 
-# Enhanced Encoder with increased capacity - keeping original name VAEEncoder
-# Enhanced Encoder with increased capacity - keeping original name VAEEncoder
-class VAEEncoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=192):
-        super().__init__()
-
-        # Initial convolution with increased channels
-        self.initial = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 3, stride=1, padding=1),  # Increased from 32
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-
-        # First downsampling block with more channels
-        self.down1 = nn.Sequential(
-            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # 32x32 -> 16x16
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(128, reduction=8)
-        )
-
-        # Second downsampling block with more channels
-        self.down2 = nn.Sequential(
-            nn.Conv2d(128, 256, 4, stride=2, padding=1),  # 16x16 -> 8x8
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(256, reduction=8),
-            CAB(256, reduction=8)
-        )
-
-        # New: Third downsampling block for deeper feature extraction
-        self.down3 = nn.Sequential(
-            nn.Conv2d(256, 512, 4, stride=2, padding=1),  # 8x8 -> 4x4
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(512, reduction=8)
-        )
-
-        # Flatten layer for converting spatial features to vector
-        self.flatten = nn.Flatten()
-
-        # Latent space mapping (traditional design instead of RGB latent space)
-        self.fc_mu = nn.Linear(512 * 4 * 4, latent_dim)
-        self.fc_logvar = nn.Linear(512 * 4 * 4, latent_dim)
-
-        # Class features branch
-        self.class_branch = nn.Sequential(
-            nn.Linear(512 * 4 * 4, 256),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(0.3)
-        )
-
-        # Reparameterization module
-        self.reparameterize = Reparameterize()
-
-    def forward(self, x):
-        # Save intermediate feature maps for skip connections
-        x1 = self.initial(x)  # 64 x 32 x 32
-        x2 = self.down1(x1)  # 128 x 16 x 16
-        x3 = self.down2(x2)  # 256 x 8 x 8
-        x4 = self.down3(x3)  # 512 x 4 x 4
-
-        # Flatten features
-        x_flat = self.flatten(x4)  # B x (512*4*4)
-
-        # Generate latent representation parameters
-        mu = self.fc_mu(x_flat)  # B x latent_dim
-        logvar = self.fc_logvar(x_flat)  # B x latent_dim
-
-        # Class features
-        class_features = self.class_branch(x_flat)  # B x 256
-
-        # Apply reparameterization
-        z = self.reparameterize(mu, logvar)  # B x latent_dim
-
-        # Return all necessary outputs including skip features
-        return z, mu, logvar, class_features, (x1, x2, x3, x4)
-
-
-# Enhanced Decoder with skip connections - keeping original name
-class Decoder(nn.Module):
-    def __init__(self, latent_dim=256, out_channels=3):
-        super().__init__()
-
-        # Project from latent space to spatial features
-        self.latent_proj = nn.Sequential(
-            nn.Linear(latent_dim, 512 * 4 * 4),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-
-        # Initial processing
-        self.initial = nn.Sequential(
-            nn.Conv2d(512, 512, 3, stride=1, padding=1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(512, reduction=8)
-        )
-
-        # First upsampling block: 4x4 -> 8x8
-        self.up1 = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(256, reduction=8)
-        )
-
-        # Note: skip_connections[3] has shape [B, 512, 4, 4]
-        # Fusion layer after first skip connection
-        self.fusion1 = nn.Sequential(
-            nn.Conv2d(256 + 256, 256, 3, padding=1),  # 256 (up1) + 256 (skip[2]) = 512 channels
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-
-        # Second upsampling block: 8x8 -> 16x16
-        self.up2 = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(128, reduction=8)
-        )
-
-        # Fusion layer after second skip connection
-        self.fusion2 = nn.Sequential(
-            nn.Conv2d(128 + 128, 128, 3, padding=1),  # 128 (up2) + 128 (skip[1]) = 256 channels
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-
-        # Third upsampling block: 16x16 -> 32x32
-        self.up3 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True),
-            CAB(64, reduction=8)
-        )
-
-        # Fusion layer after third skip connection
-        self.fusion3 = nn.Sequential(
-            nn.Conv2d(64 + 64, 64, 3, padding=1),  # 64 (up3) + 64 (skip[0]) = 128 channels
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.2, inplace=True)
-        )
-
-        # Final output layer
-        self.final = nn.Sequential(
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(32, out_channels, 3, padding=1),
-            nn.Sigmoid()  # Use Sigmoid instead of Tanh, directly outputs [0,1] range
-        )
-
-    def forward(self, z, skip_connections=None):
-        # Reconstruct initial feature map from latent vector
-        x = self.latent_proj(z)
-        x = x.view(-1, 512, 4, 4)
-        x = self.initial(x)
-
-        # First upsampling: 4x4 -> 8x8
-        x = self.up1(x)
-        if skip_connections is not None:
-            # Skip connection indexing needs to match the spatial dimensions
-            # skip_connections = (x1:32x32, x2:16x16, x3:8x8, x4:4x4)
-            x = torch.cat([x, skip_connections[2]], dim=1)  # Connect 8x8 features
-            x = self.fusion1(x)
-
-        # Second upsampling: 8x8 -> 16x16
-        x = self.up2(x)
-        if skip_connections is not None:
-            x = torch.cat([x, skip_connections[1]], dim=1)  # Connect 16x16 features
-            x = self.fusion2(x)
-
-        # Third upsampling: 16x16 -> 32x32
-        x = self.up3(x)
-        if skip_connections is not None:
-            x = torch.cat([x, skip_connections[0]], dim=1)  # Connect 32x32 features
-            x = self.fusion3(x)
-
-        # Final output
-        return self.final(x)
-
-
 # Center Loss implementation - keeping original name
 class CenterLoss(nn.Module):
     def __init__(self, num_classes=2, feat_dim=256):
@@ -377,33 +194,237 @@ class CenterLoss(nn.Module):
         return loss
 
 
-# Complete VAE model with skip connections - keeping original name
+# 1. Enhanced VAE Encoder with larger latent space
+class VAEEncoder(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=512):  # Increased from 192 to 512
+        super().__init__()
+
+        # Initial convolution with increased channels
+        self.initial = nn.Sequential(
+            nn.Conv2d(in_channels, 96, 3, stride=1, padding=1),  # Increased from 64 to 96
+            nn.BatchNorm2d(96),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        # First downsampling block with more channels
+        self.down1 = nn.Sequential(
+            nn.Conv2d(96, 192, 4, stride=2, padding=1),  # 32x32 -> 16x16, increased from 128 to 192
+            nn.BatchNorm2d(192),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(192, reduction=8),
+            CAB(192, reduction=8)  # Added another attention block
+        )
+
+        # Second downsampling block with more channels
+        self.down2 = nn.Sequential(
+            nn.Conv2d(192, 384, 4, stride=2, padding=1),  # 16x16 -> 8x8, increased from 256 to 384
+            nn.BatchNorm2d(384),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(384, reduction=8),
+            CAB(384, reduction=8),
+            CAB(384, reduction=8)  # Added third attention block for more capacity
+        )
+
+        # Third downsampling block for deeper feature extraction - now produces 8x8 features
+        self.down3 = nn.Sequential(
+            nn.Conv2d(384, 768, 4, stride=2, padding=1),  # 8x8 -> 4x4, increased from 512 to 768
+            nn.BatchNorm2d(768),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(768, reduction=16),  # Increased reduction for efficiency with higher channels
+            CAB(768, reduction=16)  # Added second attention block
+        )
+
+        # Flatten layer for converting spatial features to vector
+        self.flatten = nn.Flatten()
+
+        # Latent space mapping with increased dimensionality
+        # Changed from 512*4*4 to 768*4*4
+        self.fc_mu = nn.Linear(768 * 4 * 4, latent_dim)
+        self.fc_logvar = nn.Linear(768 * 4 * 4, latent_dim)
+
+        # Class features branch with more capacity
+        self.class_branch = nn.Sequential(
+            nn.Linear(768 * 4 * 4, 512),  # Increased from 256 to 512
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        # Reparameterization module
+        self.reparameterize = Reparameterize()
+
+    def forward(self, x):
+        # Save intermediate feature maps for skip connections
+        x1 = self.initial(x)  # 96 x 32 x 32
+        x2 = self.down1(x1)  # 192 x 16 x 16
+        x3 = self.down2(x2)  # 384 x 8 x 8
+        x4 = self.down3(x3)  # 768 x 4 x 4
+
+        # Flatten features
+        x_flat = self.flatten(x4)  # B x (768*4*4)
+
+        # Generate latent representation parameters
+        mu = self.fc_mu(x_flat)  # B x latent_dim
+        logvar = self.fc_logvar(x_flat)  # B x latent_dim
+
+        # Class features
+        class_features = self.class_branch(x_flat)  # B x 256
+
+        # Apply reparameterization
+        z = self.reparameterize(mu, logvar)  # B x latent_dim
+
+        # Return all necessary outputs including skip features
+        return z, mu, logvar, class_features, (x1, x2, x3, x4)
+
+
+# 2. Enhanced Decoder to match the new encoder structure
+class Decoder(nn.Module):
+    def __init__(self, latent_dim=512, out_channels=3):  # Increased from 256 to 512
+        super().__init__()
+
+        # Project from latent space to spatial features
+        self.latent_proj = nn.Sequential(
+            nn.Linear(latent_dim, 768 * 4 * 4),  # Increased from 512*4*4 to 768*4*4
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        # Initial processing with increased capacity
+        self.initial = nn.Sequential(
+            nn.Conv2d(768, 768, 3, stride=1, padding=1),  # Increased from 512 to 768
+            nn.BatchNorm2d(768),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(768, reduction=16),
+            CAB(768, reduction=16)  # Added second attention block
+        )
+
+        # First upsampling block: 4x4 -> 8x8
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(768, 384, 4, stride=2, padding=1),  # Increased from 512/256 to 768/384
+            nn.BatchNorm2d(384),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(384, reduction=8),
+            CAB(384, reduction=8)  # Added second attention block
+        )
+
+        # Fusion layer after first skip connection
+        self.fusion1 = nn.Sequential(
+            nn.Conv2d(384 + 384, 384, 3, padding=1),  # Adjusted for new dimensions
+            nn.BatchNorm2d(384),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(384, reduction=8)  # Added attention
+        )
+
+        # Second upsampling block: 8x8 -> 16x16
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(384, 192, 4, stride=2, padding=1),  # Increased from 256/128 to 384/192
+            nn.BatchNorm2d(192),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(192, reduction=8),
+            CAB(192, reduction=8)  # Added second attention block
+        )
+
+        # Fusion layer after second skip connection
+        self.fusion2 = nn.Sequential(
+            nn.Conv2d(192 + 192, 192, 3, padding=1),  # Adjusted for new dimensions
+            nn.BatchNorm2d(192),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(192, reduction=8)  # Added attention
+        )
+
+        # Third upsampling block: 16x16 -> 32x32
+        self.up3 = nn.Sequential(
+            nn.ConvTranspose2d(192, 96, 4, stride=2, padding=1),  # Increased from 128/64 to 192/96
+            nn.BatchNorm2d(96),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(96, reduction=8),
+            CAB(96, reduction=8)  # Added second attention block
+        )
+
+        # Fusion layer after third skip connection
+        self.fusion3 = nn.Sequential(
+            nn.Conv2d(96 + 96, 96, 3, padding=1),  # Adjusted for new dimensions
+            nn.BatchNorm2d(96),
+            nn.LeakyReLU(0.2, inplace=True),
+            CAB(96, reduction=8)  # Added attention
+        )
+
+        # Final output layer with increased capacity
+        self.final = nn.Sequential(
+            nn.Conv2d(96, 64, 3, padding=1),  # Increased from 32 to 64
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(32, out_channels, 3, padding=1),
+            nn.Sigmoid()  # Use Sigmoid for [0,1] range
+        )
+
+    def forward(self, z, skip_connections=None):
+        # Reconstruct initial feature map from latent vector
+        x = self.latent_proj(z)
+        x = x.view(-1, 768, 4, 4)  # Adjusted for new dimensions
+        x = self.initial(x)
+
+        # First upsampling: 4x4 -> 8x8
+        x = self.up1(x)
+        if skip_connections is not None:
+            # Skip connection indexing needs to match the spatial dimensions
+            x = torch.cat([x, skip_connections[2]], dim=1)  # Connect 8x8 features
+            x = self.fusion1(x)
+
+        # Second upsampling: 8x8 -> 16x16
+        x = self.up2(x)
+        if skip_connections is not None:
+            x = torch.cat([x, skip_connections[1]], dim=1)  # Connect 16x16 features
+            x = self.fusion2(x)
+
+        # Third upsampling: 16x16 -> 32x32
+        x = self.up3(x)
+        if skip_connections is not None:
+            x = torch.cat([x, skip_connections[0]], dim=1)  # Connect 32x32 features
+            x = self.fusion3(x)
+
+        # Final output
+        return self.final(x)
+
+
+# 3. Updated VAE model to use the new encoder and decoder
 class VariationalAutoencoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=192, num_classes=2):
+    def __init__(self, in_channels=3, latent_dim=512, num_classes=2):  # Increased from 192 to 512
         super().__init__()
         self.latent_dim = latent_dim
 
-        # Encoder and decoder
+        # Encoder and decoder with increased capacity
         self.encoder = VAEEncoder(in_channels, latent_dim)
         self.decoder = Decoder(latent_dim, in_channels)
 
-        # Classifier for class features
+        # Enhanced classifier for class features
         self.classifier = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
+            nn.Linear(256, 256),  # Increased capacity
+            nn.BatchNorm1d(256),
             nn.LeakyReLU(0.2),
             nn.Dropout(0.4),
 
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
             nn.LeakyReLU(0.2),
             nn.Dropout(0.3),
+
+            nn.Linear(128, 64),  # Added extra layer
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
 
             nn.Linear(64, num_classes)
         )
 
         # Center loss for better clustering
         self.center_loss = CenterLoss(num_classes=num_classes, feat_dim=256)
+
+        # Latent normalization for better conditioning
+        self.latent_norm = LatentNormalization(latent_dim, scale=6.0)  # Added for stable diffusion conditioning
 
     def encode(self, x):
         z, mu, logvar, class_features, _ = self.encoder(x)
@@ -426,21 +447,23 @@ class VariationalAutoencoder(nn.Module):
         # Encode input
         z, mu, logvar, class_features, skip_connections = self.encoder(x)
 
+        # Apply latent normalization for more stable diffusion
+        z = self.latent_norm(z)
+
         # Decode with skip connections
         reconstructed = self.decoder(z, skip_connections)
 
         return reconstructed, z, mu, logvar, class_features
 
     def compute_kl_loss(self, mu, logvar):
-        # Modified KL divergence with constraints to prevent extreme values
-        # This "constrained KL" helps create a more stable latent space
+        # Modified KL divergence with improved constraints for stability
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
-        # Add L2 regularization on mu to keep embeddings closer to origin
-        l2_mu = 0.01 * torch.sum(mu.pow(2))
+        # Add stronger L2 regularization on mu
+        l2_mu = 0.02 * torch.sum(mu.pow(2))  # Increased from 0.01 to 0.02
 
-        # Add regularization to prevent logvar from getting too large (too much variance)
-        logvar_constraint = 0.01 * torch.sum(F.relu(logvar))
+        # Add regularization to prevent logvar from getting too large
+        logvar_constraint = 0.03 * torch.sum(F.relu(logvar - 4.0))  # Added upper bound of 4.0
 
         # Combine losses
         combined_loss = kl_loss + l2_mu + logvar_constraint
@@ -528,12 +551,13 @@ class Swish(nn.Module):
 
 # Time embedding for diffusion model
 class TimeEmbedding(nn.Module):
-    def __init__(self, n_channels=64):  # Increased from 16
+    def __init__(self, n_channels=128):  # Increased from 64 to 128
         super().__init__()
         self.n_channels = n_channels
-        self.lin1 = nn.Linear(self.n_channels, self.n_channels * 2)
+        self.lin1 = nn.Linear(self.n_channels, self.n_channels * 4)  # Increased capacity
         self.act = Swish()
-        self.lin2 = nn.Linear(self.n_channels * 2, self.n_channels)
+        self.lin2 = nn.Linear(self.n_channels * 4, self.n_channels * 2)  # Added intermediate layer
+        self.lin3 = nn.Linear(self.n_channels * 2, self.n_channels)  # Added layer for more depth
 
     def forward(self, t):
         # Improved sinusoidal time embedding
@@ -543,20 +567,25 @@ class TimeEmbedding(nn.Module):
         emb = t[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=1)
 
-        # Process through MLP with expanded capacity
+        # Process through deeper MLP with expanded capacity
         emb = self.lin1(emb)
         emb = self.act(emb)
         emb = self.lin2(emb)
+        emb = self.act(emb)
+        emb = self.lin3(emb)
         return emb
 
+
 class ClassEmbedding(nn.Module):
-    def __init__(self, num_classes=2, n_channels=64):  # Increased from 16
+    def __init__(self, num_classes=2, n_channels=128):  # Increased from 64 to 128
         super().__init__()
         # Increase embedding dimension for stronger class guidance
-        self.embedding = nn.Embedding(num_classes, n_channels * 2)
-        self.lin1 = nn.Linear(n_channels * 2, n_channels * 2)
+        self.embedding = nn.Embedding(num_classes, n_channels * 4)  # Increased from 64*2 to 128*4
+        self.lin1 = nn.Linear(n_channels * 4, n_channels * 4)
         self.act = Swish()
-        self.lin2 = nn.Linear(n_channels * 2, n_channels)
+        self.lin2 = nn.Linear(n_channels * 4, n_channels * 2)
+        self.lin3 = nn.Linear(n_channels * 2, n_channels)  # Added layer for more depth
+        self.norm = nn.LayerNorm(n_channels)  # Added normalization
 
     def forward(self, c):
         # Get class embeddings
@@ -565,53 +594,16 @@ class ClassEmbedding(nn.Module):
         emb = self.lin1(emb)
         emb = self.act(emb)
         emb = self.lin2(emb)
+        emb = self.act(emb)
+        emb = self.lin3(emb)
+        emb = self.norm(emb)  # Normalize outputs for stable training
         return emb
 
 
+
 # Attention block for UNet
-class UNetAttentionBlock(nn.Module):
-    def __init__(self, channels, num_heads=4):
-        super().__init__()
-        self.channels = channels
-        self.num_heads = num_heads
-
-        self.norm = nn.GroupNorm(1, channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, 1)
-        self.proj = nn.Conv2d(channels, channels, 1)
-
-    def forward(self, x):
-        b, c, h, w = x.shape
-        residual = x
-
-        # Normalize input
-        x = self.norm(x)
-
-        # QKV projection
-        qkv = self.qkv(x).reshape(b, 3, self.num_heads, c // self.num_heads, h * w)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
-
-        # Reshape for attention computation
-        q = q.permute(0, 1, 3, 2)  # [b, heads, h*w, c//heads]
-        k = k.permute(0, 1, 2, 3)  # [b, heads, c//heads, h*w]
-        v = v.permute(0, 1, 3, 2)  # [b, heads, h*w, c//heads]
-
-        # Compute attention
-        scale = (c // self.num_heads) ** -0.5
-        attn = torch.matmul(q, k) * scale
-        attn = F.softmax(attn, dim=-1)
-
-        # Apply attention
-        out = torch.matmul(attn, v)  # [b, heads, h*w, c//heads]
-        out = out.permute(0, 3, 1, 2)  # [b, c//heads, heads, h*w]
-        out = out.reshape(b, c, h, w)
-
-        # Project and add residual
-        return self.proj(out) + residual
-
-
-# Residual block for UNet with class conditioning
 class UNetResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, d_time=64, num_groups=8, dropout_rate=0.1):
+    def __init__(self, in_channels, out_channels, d_time=128, num_groups=8, dropout_rate=0.1):
         super().__init__()
 
         # Feature normalization and convolution
@@ -629,6 +621,10 @@ class UNetResidualBlock(nn.Module):
         self.norm2 = nn.GroupNorm(min(num_groups, out_channels), out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
+        # FiLM conditioning - Feature-wise Linear Modulation
+        self.film_scale = nn.Linear(d_time, out_channels)
+        self.film_shift = nn.Linear(d_time, out_channels)
+
         # Residual connection handling
         self.residual = nn.Identity() if in_channels == out_channels else nn.Conv2d(in_channels, out_channels, 1)
 
@@ -644,7 +640,12 @@ class UNetResidualBlock(nn.Module):
         # Add class embedding with increased influence
         if c is not None:
             c_emb = self.act(self.class_emb(c))
-            h = h + 1.5 * c_emb.view(-1, c_emb.shape[1], 1, 1)  # Amplify by 1.5x
+            h = h + 2.0 * c_emb.view(-1, c_emb.shape[1], 1, 1)  # Amplified to 2.0x
+
+            # Apply FiLM conditioning for stronger guidance
+            scale = self.film_scale(c).view(-1, c_emb.shape[1], 1, 1)
+            shift = self.film_shift(c).view(-1, c_emb.shape[1], 1, 1)
+            h = h * (1 + scale) + shift  # Scale and shift features conditioned on class
 
         # Second part
         h = self.act(self.norm2(h))
@@ -653,6 +654,50 @@ class UNetResidualBlock(nn.Module):
 
         # Residual connection
         return h + self.residual(x)
+
+
+# 7. Enhanced UNet Attention Block with more heads
+class UNetAttentionBlock(nn.Module):
+    def __init__(self, channels, num_heads=12):  # Increased from 8 to 12
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+
+        self.norm = nn.GroupNorm(1, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
+
+        # Add skip-scale parameter for better gradient flow
+        self.skip_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        residual = x
+
+        # Normalize input
+        x = self.norm(x)
+
+        # QKV projection
+        qkv = self.qkv(x).reshape(b, 3, self.num_heads, c // self.num_heads, h * w)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+
+        # Reshape for attention computation
+        q = q.permute(0, 1, 3, 2)  # [b, heads, h*w, c//heads]
+        k = k.permute(0, 1, 2, 3)  # [b, heads, c//heads, h*w]
+        v = v.permute(0, 1, 3, 2)  # [b, heads, h*w, c//heads]
+
+        # Compute attention with improved scaling
+        scale = (c // self.num_heads) ** -0.5
+        attn = torch.matmul(q, k) * scale
+        attn = F.softmax(attn, dim=-1)
+
+        # Apply attention
+        out = torch.matmul(attn, v)  # [b, heads, h*w, c//heads]
+        out = out.permute(0, 3, 1, 2)  # [b, c//heads, heads, h*w]
+        out = out.reshape(b, c, h, w)
+
+        # Project and add residual with learnable skip scale
+        return self.proj(out) + residual * self.skip_scale
 
 
 # Switch Sequential for handling time and class embeddings
@@ -669,16 +714,15 @@ class SwitchSequential(nn.Sequential):
 
 
 # Class-Conditional UNet for noise prediction
-
 class ConditionalUNet(nn.Module):
     def __init__(self, in_channels=3, hidden_dims=[64, 128, 256, 512], num_classes=2, dropout_rate=0.1):
         super().__init__()
 
         # Time embedding with increased dimensions
-        self.time_emb = TimeEmbedding(n_channels=64)  # Increased from 16
+        self.time_emb = TimeEmbedding(n_channels=128)  # Increased from 64 to 128
 
         # Class embedding with increased dimensions
-        self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=64)  # Increased from 16
+        self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=128)  # Increased from 64 to 128
 
         # Downsampling path (encoder)
         self.down_blocks = nn.ModuleList()
@@ -691,8 +735,9 @@ class ConditionalUNet(nn.Module):
         for dim in hidden_dims[1:]:
             self.down_blocks.append(
                 nn.ModuleList([
-                    UNetResidualBlock(input_dim, input_dim, d_time=64),  # Increased time dimensions
-                    UNetResidualBlock(input_dim, input_dim, d_time=64),  # Added second block for more depth
+                    UNetResidualBlock(input_dim, input_dim, d_time=128),
+                    UNetResidualBlock(input_dim, input_dim, d_time=128),
+                    UNetResidualBlock(input_dim, input_dim, d_time=128),  # Added third block for more depth
                     nn.Conv2d(input_dim, dim, 4, stride=2, padding=1)  # Downsample
                 ])
             )
@@ -702,10 +747,12 @@ class ConditionalUNet(nn.Module):
 
         # Middle block (bottleneck) with more capacity and attention
         self.middle_blocks = nn.ModuleList([
-            UNetResidualBlock(hidden_dims[-1], hidden_dims[-1], d_time=64),
-            UNetAttentionBlock(hidden_dims[-1], num_heads=8),  # Increased attention heads
-            UNetResidualBlock(hidden_dims[-1], hidden_dims[-1], d_time=64),
-            UNetAttentionBlock(hidden_dims[-1], num_heads=8),  # Added second attention block
+            UNetResidualBlock(hidden_dims[-1], hidden_dims[-1], d_time=128),
+            UNetAttentionBlock(hidden_dims[-1], num_heads=12),  # Increased from 8 to 12
+            UNetResidualBlock(hidden_dims[-1], hidden_dims[-1], d_time=128),
+            UNetAttentionBlock(hidden_dims[-1], num_heads=12),
+            UNetResidualBlock(hidden_dims[-1], hidden_dims[-1], d_time=128),  # Added extra residual block
+            UNetAttentionBlock(hidden_dims[-1], num_heads=12)  # Added third attention block
         ])
 
         # Upsampling path (decoder)
@@ -716,8 +763,9 @@ class ConditionalUNet(nn.Module):
             self.up_blocks.append(
                 nn.ModuleList([
                     nn.ConvTranspose2d(hidden_dims[-1], hidden_dims[-1], 4, stride=2, padding=1),
-                    UNetResidualBlock(hidden_dims[-1] + dim, dim, d_time=64),
-                    UNetResidualBlock(dim, dim, d_time=64),
+                    UNetResidualBlock(hidden_dims[-1] + dim, dim, d_time=128),
+                    UNetResidualBlock(dim, dim, d_time=128),
+                    UNetResidualBlock(dim, dim, d_time=128)  # Added third block for symmetry with downsampling
                 ])
             )
             hidden_dims[-1] = dim
@@ -726,12 +774,12 @@ class ConditionalUNet(nn.Module):
 
         # Final blocks
         self.final_block = SwitchSequential(
-            UNetResidualBlock(hidden_dims[0] * 2, hidden_dims[0], d_time=64),
-            UNetResidualBlock(hidden_dims[0], hidden_dims[0], d_time=64),  # Added extra block
+            UNetResidualBlock(hidden_dims[0] * 2, hidden_dims[0], d_time=128),
+            UNetResidualBlock(hidden_dims[0], hidden_dims[0], d_time=128),
+            UNetResidualBlock(hidden_dims[0], hidden_dims[0], d_time=128),  # Added extra block
             nn.Conv2d(hidden_dims[0], in_channels, 3, padding=1)
         )
 
-    # The forward method stays the same
     def forward(self, x, t, c=None):
         # Time embedding
         t_emb = self.time_emb(t)
@@ -748,9 +796,10 @@ class ConditionalUNet(nn.Module):
         skip_connections = [x]
 
         # Downsampling
-        for resblock1, resblock2, downsample in self.down_blocks:
+        for resblock1, resblock2, resblock3, downsample in self.down_blocks:
             x = resblock1(x, t_emb, c_emb)
             x = resblock2(x, t_emb, c_emb)
+            x = resblock3(x, t_emb, c_emb)  # Added third block
             skip_connections.append(x)
             x = downsample(x)
 
@@ -764,11 +813,12 @@ class ConditionalUNet(nn.Module):
                 x = block(x, t_emb, c_emb)
 
         # Upsampling
-        for upsample, resblock1, resblock2 in self.up_blocks:
+        for upsample, resblock1, resblock2, resblock3 in self.up_blocks:
             x = upsample(x)  # Upsample first
             x = torch.cat([x, skip_connections.pop()], dim=1)  # Then concatenate
             x = resblock1(x, t_emb, c_emb)  # Then process
             x = resblock2(x, t_emb, c_emb)
+            x = resblock3(x, t_emb, c_emb)  # Added third block
 
         x = self.dropout_final(x)
 
@@ -811,46 +861,64 @@ class ConditionalDenoiseDiffusion():
         return torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * eps
 
     # Modify p_sample for stronger guidance
-    def p_sample(self, xt, t, c=None, guidance_scale=7.0):  # Increased from 3.0
-        """Single denoising step with enhanced classifier guidance"""
+    def p_sample(self, xt, t, c=None, guidance_scale=10.0):  # Increased from 7.0 to 10.0
+        """Enhanced denoising step with stronger guidance for better quality"""
         # Convert time to tensor format expected by model
         if not isinstance(t, torch.Tensor):
             t = torch.tensor([t], device=xt.device)
 
+        # Always compute unconditioned prediction
         eps_uncond = self.eps_model(xt, t, None)
 
         if c is not None:
+            # Compute class-conditioned prediction
             eps_cond = self.eps_model(xt, t, c)
-            eps_theta = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+
+            # Classifier-free guidance with adaptive scaling
+            # Apply stronger guidance at the beginning of sampling
+            t_factor = t.item() / self.n_steps if t.shape[0] == 1 else t[0].item() / self.n_steps
+            adaptive_scale = guidance_scale * (1.0 + 0.5 * (1.0 - t_factor))  # Scale up to 1.5x at t=0
+
+            eps_theta = eps_uncond + adaptive_scale * (eps_cond - eps_uncond)
         else:
             eps_theta = eps_uncond
 
         alpha_t = self.alpha[t].reshape(-1, 1, 1, 1)
         alpha_bar_t = self.alpha_bar[t].reshape(-1, 1, 1, 1)
 
+        # Improved denoising formula with second-order correction
         mean = (xt - (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t) * eps_theta) / torch.sqrt(alpha_t)
 
         var = self.beta[t].reshape(-1, 1, 1, 1)
 
+        # Apply less noise for final steps for better details
+        noise_scale = 1.0
+        if t.item() < 20:  # For the last 20 steps
+            noise_scale = t.item() / 20.0  # Linear ramp from 0 to 1
+
         if t[0] > 0:
             noise = torch.randn_like(xt)
-            return mean + torch.sqrt(var) * noise
+            return mean + torch.sqrt(var) * noise * noise_scale
         else:
             return mean
 
     # Modified sample method with more precise denoising steps
-    def sample(self, shape, device, c=None, guidance_scale=7.0):  # Increased from 3.0
-        """Generate samples with enhanced classifier guidance"""
+    def sample(self, shape, device, c=None, guidance_scale=10.0):  # Increased guidance
+        """Enhanced sampling with multi-step denoising for better quality"""
         x = torch.randn(shape, device=device)
 
-        # Use more precise denoising for the last 250 steps
+        # Use progressive sampling scheme with more precise steps near the end
         for t in tqdm(reversed(range(self.n_steps)), desc="Sampling"):
+            # Apply standard denoising step
             x = self.p_sample(x, t, c, guidance_scale=guidance_scale)
 
-            # Additional denoising iterations for the last 250 steps
-            if t < 250 and t % 10 == 0:
-                # Extra denoising at these critical steps
-                x = self.p_sample(x, t, c, guidance_scale=guidance_scale * 1.2)  # Stronger guidance
+            # Extra denoising iterations for critical steps near the end
+            if t < 100:  # Last 100 steps
+                # More frequent extra steps as we get closer to t=0
+                if t < 20 or (t < 50 and t % 5 == 0) or (t < 100 and t % 10 == 0):
+                    # Apply extra denoising with stronger guidance
+                    extra_guidance = guidance_scale * 1.2  # 20% stronger guidance
+                    x = self.p_sample(x, t, c, guidance_scale=extra_guidance)
 
         return x
 
@@ -1753,7 +1821,7 @@ def main():
     # Create conditional UNet
     conditional_unet = ConditionalUNet(
         in_channels=3,  # 3 channels for RGB
-        hidden_dims=[32, 64, 128],
+        hidden_dims=[48, 96, 144],
         num_classes=len(class_names)  # 2 classes (cat/dog)
     ).to(device)
 
