@@ -146,6 +146,19 @@ class Reparameterize(nn.Module):
             return mu
 
 
+class LatentNormalization(nn.Module):
+    def __init__(self, latent_dim, scale=4.0):
+        super().__init__()
+        self.scale = scale
+        self.norm = nn.LayerNorm(latent_dim)
+
+    def forward(self, z):
+        # Apply layer normalization and scale
+        # This helps control the range of latent values
+        return torch.tanh(self.norm(z)) * self.scale
+
+
+# Enhanced Encoder with increased capacity - keeping original name VAEEncoder
 # Enhanced Encoder with increased capacity - keeping original name VAEEncoder
 class VAEEncoder(nn.Module):
     def __init__(self, in_channels=3, latent_dim=192):
@@ -334,30 +347,32 @@ class CenterLoss(nn.Module):
         super(CenterLoss, self).__init__()
         self.num_classes = num_classes
         self.feat_dim = feat_dim
-        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim))
+        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim) * 0.1)  # Initialize closer to origin
 
     def forward(self, x, labels):
         batch_size = x.size(0)
 
-        # Apply L2 normalization
+        # Apply stronger L2 normalization
         x_norm = F.normalize(x, p=2, dim=1)
         centers_norm = F.normalize(self.centers, p=2, dim=1)
 
-        # Calculate distance matrix
-        distmat = torch.pow(x_norm, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
-                  torch.pow(centers_norm, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
+        # Calculate squared distances directly
+        distmat = torch.cdist(x_norm, centers_norm, p=2).pow(2)
 
-        # Use updated addmm_ syntax
-        distmat.addmm_(x_norm, centers_norm.t(), beta=1, alpha=-2)
+        # Get class-specific distances
+        labels_expand = labels.view(batch_size, 1).expand(batch_size, self.num_classes)
+        mask = labels_expand == torch.arange(self.num_classes, device=labels.device).expand(batch_size,
+                                                                                            self.num_classes)
 
-        # Get class mask
-        classes = torch.arange(self.num_classes).to(labels.device)
-        labels = labels.unsqueeze(1).expand(batch_size, self.num_classes)
-        mask = labels.eq(classes.expand(batch_size, self.num_classes))
-
-        # Apply mask and calculate loss
+        # Only consider distances to correct class centers
         dist = distmat * mask.float()
-        loss = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
+
+        # Add a margin-based loss to push incorrect classes further away
+        incorrect_mask = ~mask
+        margin_loss = F.relu(1.0 - distmat) * incorrect_mask.float()
+
+        # Combine losses with higher weight on center loss
+        loss = (dist.sum() + 0.5 * margin_loss.sum()) / batch_size
 
         return loss
 
@@ -417,13 +432,21 @@ class VariationalAutoencoder(nn.Module):
         return reconstructed, z, mu, logvar, class_features
 
     def compute_kl_loss(self, mu, logvar):
-        # Compute KL divergence loss with numerical stability
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp() + 1e-8)
+        # Modified KL divergence with constraints to prevent extreme values
+        # This "constrained KL" helps create a more stable latent space
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+
+        # Add L2 regularization on mu to keep embeddings closer to origin
+        l2_mu = 0.01 * torch.sum(mu.pow(2))
+
+        # Add regularization to prevent logvar from getting too large (too much variance)
+        logvar_constraint = 0.01 * torch.sum(F.relu(logvar))
+
+        # Combine losses
+        combined_loss = kl_loss + l2_mu + logvar_constraint
 
         batch_size = mu.size(0)
-        kl_loss = kl_loss / batch_size
-
-        return kl_loss
+        return combined_loss / batch_size
 
 
 # Enhanced reconstruction loss function
@@ -505,39 +528,44 @@ class Swish(nn.Module):
 
 # Time embedding for diffusion model
 class TimeEmbedding(nn.Module):
-    def __init__(self, n_channels=16):
+    def __init__(self, n_channels=64):  # Increased from 16
         super().__init__()
         self.n_channels = n_channels
-        self.lin1 = nn.Linear(self.n_channels, self.n_channels)
+        self.lin1 = nn.Linear(self.n_channels, self.n_channels * 2)
         self.act = Swish()
-        self.lin2 = nn.Linear(self.n_channels, self.n_channels)
+        self.lin2 = nn.Linear(self.n_channels * 2, self.n_channels)
 
     def forward(self, t):
-        # Sinusoidal time embedding similar to positional encoding
+        # Improved sinusoidal time embedding
         half_dim = self.n_channels // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
         emb = t[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=1)
 
-        # Process through MLP
-        return self.lin2(self.act(self.lin1(emb)))
+        # Process through MLP with expanded capacity
+        emb = self.lin1(emb)
+        emb = self.act(emb)
+        emb = self.lin2(emb)
+        return emb
 
-
-# Class embedding for conditional diffusion
 class ClassEmbedding(nn.Module):
-    def __init__(self, num_classes=2, n_channels=16):
+    def __init__(self, num_classes=2, n_channels=64):  # Increased from 16
         super().__init__()
-        self.embedding = nn.Embedding(num_classes, n_channels)
-        self.lin1 = nn.Linear(n_channels, n_channels)
+        # Increase embedding dimension for stronger class guidance
+        self.embedding = nn.Embedding(num_classes, n_channels * 2)
+        self.lin1 = nn.Linear(n_channels * 2, n_channels * 2)
         self.act = Swish()
-        self.lin2 = nn.Linear(n_channels, n_channels)
+        self.lin2 = nn.Linear(n_channels * 2, n_channels)
 
     def forward(self, c):
         # Get class embeddings
         emb = self.embedding(c)
-        # Process through MLP (same structure as time embedding)
-        return self.lin2(self.act(self.lin1(emb)))
+        # Process through MLP
+        emb = self.lin1(emb)
+        emb = self.act(emb)
+        emb = self.lin2(emb)
+        return emb
 
 
 # Attention block for UNet
@@ -583,16 +611,16 @@ class UNetAttentionBlock(nn.Module):
 
 # Residual block for UNet with class conditioning
 class UNetResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, d_time=16, num_groups=8, dropout_rate=0.2):
+    def __init__(self, in_channels, out_channels, d_time=64, num_groups=8, dropout_rate=0.1):
         super().__init__()
 
         # Feature normalization and convolution
         self.norm1 = nn.GroupNorm(min(num_groups, in_channels), in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
-        # Time and class embedding projections
+        # Time and class embedding projections with increased dimensions
         self.time_emb = nn.Linear(d_time, out_channels)
-        self.class_emb = nn.Linear(d_time, out_channels)  # Same dimension as time embedding
+        self.class_emb = nn.Linear(d_time, out_channels)
         self.act = Swish()
 
         self.dropout = nn.Dropout(dropout_rate)
@@ -613,10 +641,10 @@ class UNetResidualBlock(nn.Module):
         t_emb = self.act(self.time_emb(t))
         h = h + t_emb.view(-1, t_emb.shape[1], 1, 1)
 
-        # Add class embedding if provided
+        # Add class embedding with increased influence
         if c is not None:
             c_emb = self.act(self.class_emb(c))
-            h = h + c_emb.view(-1, c_emb.shape[1], 1, 1)
+            h = h + 1.5 * c_emb.view(-1, c_emb.shape[1], 1, 1)  # Amplify by 1.5x
 
         # Second part
         h = self.act(self.norm2(h))
@@ -641,20 +669,21 @@ class SwitchSequential(nn.Sequential):
 
 
 # Class-Conditional UNet for noise prediction
+
 class ConditionalUNet(nn.Module):
-    def __init__(self, in_channels=3, hidden_dims=[16, 32, 64], num_classes=2, dropout_rate=0.2):
+    def __init__(self, in_channels=3, hidden_dims=[64, 128, 256, 512], num_classes=2, dropout_rate=0.1):
         super().__init__()
 
-        # Time embedding
-        self.time_emb = TimeEmbedding(n_channels=16)
+        # Time embedding with increased dimensions
+        self.time_emb = TimeEmbedding(n_channels=64)  # Increased from 16
 
-        # Class embedding
-        self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=16)
+        # Class embedding with increased dimensions
+        self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=64)  # Increased from 16
 
         # Downsampling path (encoder)
         self.down_blocks = nn.ModuleList()
 
-        # Initial convolution
+        # Initial convolution with more filters
         self.initial_conv = nn.Conv2d(in_channels, hidden_dims[0], 3, padding=1)
 
         # Downsampling blocks
@@ -662,8 +691,8 @@ class ConditionalUNet(nn.Module):
         for dim in hidden_dims[1:]:
             self.down_blocks.append(
                 nn.ModuleList([
-                    UNetResidualBlock(input_dim, input_dim),
-                    UNetResidualBlock(input_dim, input_dim),
+                    UNetResidualBlock(input_dim, input_dim, d_time=64),  # Increased time dimensions
+                    UNetResidualBlock(input_dim, input_dim, d_time=64),  # Added second block for more depth
                     nn.Conv2d(input_dim, dim, 4, stride=2, padding=1)  # Downsample
                 ])
             )
@@ -671,11 +700,12 @@ class ConditionalUNet(nn.Module):
 
         self.dropout_mid = nn.Dropout(dropout_rate)
 
-        # Middle block (bottleneck)
+        # Middle block (bottleneck) with more capacity and attention
         self.middle_blocks = nn.ModuleList([
-            UNetResidualBlock(hidden_dims[-1], hidden_dims[-1]),
-            UNetAttentionBlock(hidden_dims[-1]),
-            UNetResidualBlock(hidden_dims[-1], hidden_dims[-1])
+            UNetResidualBlock(hidden_dims[-1], hidden_dims[-1], d_time=64),
+            UNetAttentionBlock(hidden_dims[-1], num_heads=8),  # Increased attention heads
+            UNetResidualBlock(hidden_dims[-1], hidden_dims[-1], d_time=64),
+            UNetAttentionBlock(hidden_dims[-1], num_heads=8),  # Added second attention block
         ])
 
         # Upsampling path (decoder)
@@ -686,8 +716,8 @@ class ConditionalUNet(nn.Module):
             self.up_blocks.append(
                 nn.ModuleList([
                     nn.ConvTranspose2d(hidden_dims[-1], hidden_dims[-1], 4, stride=2, padding=1),
-                    UNetResidualBlock(hidden_dims[-1] + dim, dim),
-                    UNetResidualBlock(dim, dim),
+                    UNetResidualBlock(hidden_dims[-1] + dim, dim, d_time=64),
+                    UNetResidualBlock(dim, dim, d_time=64),
                 ])
             )
             hidden_dims[-1] = dim
@@ -696,10 +726,12 @@ class ConditionalUNet(nn.Module):
 
         # Final blocks
         self.final_block = SwitchSequential(
-            UNetResidualBlock(hidden_dims[0] * 2, hidden_dims[0]),
+            UNetResidualBlock(hidden_dims[0] * 2, hidden_dims[0], d_time=64),
+            UNetResidualBlock(hidden_dims[0], hidden_dims[0], d_time=64),  # Added extra block
             nn.Conv2d(hidden_dims[0], in_channels, 3, padding=1)
         )
 
+    # The forward method stays the same
     def forward(self, x, t, c=None):
         # Time embedding
         t_emb = self.time_emb(t)
@@ -754,12 +786,22 @@ class ConditionalDenoiseDiffusion():
         self.eps_model = eps_model
         self.device = device
 
-        # Linear beta schedule
-        self.beta = torch.linspace(0.0001, 0.02, n_steps).to(device)
+        # Switch to cosine beta schedule for better results
+        def cosine_beta_schedule(timesteps, s=0.008):
+            steps = timesteps + 1
+            x = torch.linspace(0, timesteps, steps)
+            alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            return torch.clip(betas, 0.0001, 0.9999)
+
+        # Use cosine schedule instead of linear
+        self.beta = cosine_beta_schedule(n_steps).to(device)
         self.alpha = 1 - self.beta
         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
         self.n_steps = n_steps
 
+    # The q_sample method stays the same
     def q_sample(self, x0, t, eps=None):
         """Forward diffusion process: add noise to data"""
         if eps is None:
@@ -768,7 +810,8 @@ class ConditionalDenoiseDiffusion():
         alpha_bar_t = self.alpha_bar[t].reshape(-1, 1, 1, 1)
         return torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * eps
 
-    def p_sample(self, xt, t, c=None, guidance_scale=3.0):
+    # Modify p_sample for stronger guidance
+    def p_sample(self, xt, t, c=None, guidance_scale=7.0):  # Increased from 3.0
         """Single denoising step with enhanced classifier guidance"""
         # Convert time to tensor format expected by model
         if not isinstance(t, torch.Tensor):
@@ -795,15 +838,23 @@ class ConditionalDenoiseDiffusion():
         else:
             return mean
 
-    def sample(self, shape, device, c=None, guidance_scale=3.0):
+    # Modified sample method with more precise denoising steps
+    def sample(self, shape, device, c=None, guidance_scale=7.0):  # Increased from 3.0
         """Generate samples with enhanced classifier guidance"""
         x = torch.randn(shape, device=device)
 
+        # Use more precise denoising for the last 250 steps
         for t in tqdm(reversed(range(self.n_steps)), desc="Sampling"):
             x = self.p_sample(x, t, c, guidance_scale=guidance_scale)
 
+            # Additional denoising iterations for the last 250 steps
+            if t < 250 and t % 10 == 0:
+                # Extra denoising at these critical steps
+                x = self.p_sample(x, t, c, guidance_scale=guidance_scale * 1.2)  # Stronger guidance
+
         return x
 
+    # Modify loss function to use direct MSE for better optimization
     def loss(self, x0, labels=None):
         """Calculate noise prediction loss with optional class conditioning"""
         batch_size = x0.shape[0]
@@ -818,7 +869,8 @@ class ConditionalDenoiseDiffusion():
         # Predict noise (with class conditioning if labels provided)
         eps_theta = self.eps_model(xt, t, labels)
 
-        return euclidean_distance_loss(eps, eps_theta)
+        # Use direct MSE loss instead of euclidean_distance_loss
+        return F.mse_loss(eps, eps_theta)
 
 
 # Function to generate a grid of samples for all classes
@@ -1515,7 +1567,7 @@ def main():
 
         # Define train function
         def train_vae(vae, train_loader, num_epochs=150, lr=5e-5,
-                      lambda_recon=1.0, lambda_cls=0.5, lambda_center=0.1, lambda_kl=0.05,
+                      lambda_recon=1.0, lambda_cls=0.5, lambda_center=0.1, lambda_kl=50,
                       visualize_every=1, save_dir="./results"):
             """
             Train VAE with improved hyperparameters and training approach
@@ -1558,7 +1610,6 @@ def main():
                 scaler = torch.cuda.amp.GradScaler()
 
             for epoch in range(num_epochs):
-                vae.train()
                 epoch_recon_loss = 0
                 epoch_class_loss = 0
                 epoch_center_loss = 0
@@ -1671,11 +1722,11 @@ def main():
         vae, ae_losses = train_vae(
             vae,
             train_loader,  # Add this parameter
-            num_epochs=30,
+            num_epochs=60,
             lr=1e-4,
             lambda_cls=0.2,
             lambda_center=0.5,
-            lambda_kl=0.01,
+            lambda_kl=5,
             visualize_every=15,
             save_dir=results_dir
         )
@@ -1723,24 +1774,29 @@ def main():
         conditional_unet.apply(init_weights)
 
         # Define train function
-        def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
+        def train_conditional_diffusion(vae, unet, num_epochs=150, lr=5e-4, visualize_every=10,
                                         save_dir="./results"):
             print("Starting Class-Conditional Diffusion Model training...")
             os.makedirs(save_dir, exist_ok=True)
 
-            autoencoder.eval()  # Set autoencoder to evaluation mode
+            vae.eval()  # Set vae to evaluation mode
 
             # Create diffusion model
             diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device)
-            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=5e-4)
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=5
+
+            # Use AdamW with better parameters
+            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-6)
+
+            # Cosine annealing scheduler for better convergence
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, T_0=10, T_mult=2, eta_min=1e-6
             )
 
             # Training loop
             loss_history = []
 
             for epoch in range(num_epochs):
+                vae.eval()  # Keep VAE in eval mode
                 epoch_loss = 0
 
                 for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
@@ -1749,36 +1805,28 @@ def main():
 
                     # Encode images to latent space
                     with torch.no_grad():
-                        # Handle the encode method which might return multiple values
-                        encode_output = autoencoder.encode(data)
+                        # Get latent representation (z)
+                        z, _ = vae.encode(data)
 
-                        # Extract latent representation from tuple
-                        if isinstance(encode_output, tuple):
-                            latents = encode_output[0]  # Get the first element (latent z)
-                        else:
-                            latents = encode_output
-
-                        # Reshape latents to spatial form if needed
-                        if len(latents.shape) == 2:  # If latents is [B, latent_dim]
-                            # Assuming a 256-dim latent vector needs to be reshaped to 3D for diffusion
-                            # This is an approximation - adjust according to your diffusion model's expectations
-                            latent_dim = latents.shape[1]
-                            spatial_size = int((latent_dim / 3) ** 0.5)  # Calculate spatial dimension
-
-                            if spatial_size ** 2 * 3 == latent_dim:  # If perfect square
-                                latents = latents.view(-1, 3, spatial_size, spatial_size)
+                        # Handle 1D latent vectors by reshaping to spatial form (3, 8, 8)
+                        if len(z.shape) == 2:
+                            # Ensure we're using exactly 192 dimensions (3*8*8)
+                            latent_dim = z.shape[1]
+                            if latent_dim >= 192:
+                                z = z[:, :192].view(-1, 3, 8, 8)
                             else:
-                                # If not a perfect fit, use a different approach or fixed size
-                                print(f"Warning: Latent dim {latent_dim} can't be reshaped perfectly to 3D")
-                                # For example, reshape to fixed 8x8 and use only part of the latent
-                                latents = latents[:, :192].view(-1, 3, 8, 8)  # Use first 192 dimensions
+                                # If latent dim is smaller, pad it to 192
+                                pad_size = 192 - latent_dim
+                                padding = torch.zeros(z.size(0), pad_size, device=z.device)
+                                z = torch.cat([z, padding], dim=1).view(-1, 3, 8, 8)
 
                     # Calculate diffusion loss with class conditioning
-                    loss = diffusion.loss(latents, labels)
+                    loss = diffusion.loss(z, labels)
 
                     # Backward pass
                     optimizer.zero_grad()
                     loss.backward()
+                    # Gradient clipping to prevent instability
                     torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
                     optimizer.step()
 
@@ -1790,23 +1838,23 @@ def main():
                 print(f"Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.6f}")
 
                 # Learning rate scheduling
-                scheduler.step(avg_loss)
+                scheduler.step()
 
                 # Visualize samples periodically
                 if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
                     # Generate samples for both classes
                     for class_idx in range(len(class_names)):
                         create_diffusion_animation(
-                            autoencoder, diffusion, class_idx=class_idx, num_frames=50,
+                            vae, diffusion, class_idx=class_idx, num_frames=50,
                             save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif"
                         )
                         save_path = f"{save_dir}/sample_class_{class_names[class_idx]}_epoch_{epoch + 1}.png"
                         generate_class_samples(
-                            autoencoder, diffusion, target_class=class_idx, num_samples=5, save_path=save_path
+                            vae, diffusion, target_class=class_idx, num_samples=5, save_path=save_path
                         )
                         save_path = f"{save_dir}/denoising_path_{class_names[class_idx]}_epoch_{epoch + 1}.png"
                         visualize_denoising_steps(
-                            autoencoder, diffusion, class_idx=class_idx, save_path=save_path
+                            vae, diffusion, class_idx=class_idx, save_path=save_path
                         )
 
                     # Save checkpoint
@@ -1816,8 +1864,8 @@ def main():
 
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            vae, conditional_unet, num_epochs=100, lr=1e-3,
-            visualize_every=1,  # Visualize every 5 epochs
+            vae, conditional_unet, num_epochs=200, lr=1e-3,
+            visualize_every=10,  # Visualize every 5 epochs
             save_dir=results_dir
         )
 
