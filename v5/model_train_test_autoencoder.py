@@ -446,7 +446,7 @@ class SwitchSequential(nn.Sequential):
 # Class-Conditional UNet modified for flat latent space
 # Revised ConditionalUNet for flat latent space with proper dimension handling
 class ConditionalUNet(nn.Module):
-    def __init__(self, latent_dim=128, hidden_dims=[256, 512, 256], time_emb_dim=128, num_classes=2, dropout_rate=0.2):
+    def __init__(self, latent_dim=128, hidden_dims=[256, 512, 256], time_emb_dim=128, num_classes=2, dropout_rate=0.3):
         super().__init__()
         self.latent_dim = latent_dim
 
@@ -1389,7 +1389,7 @@ def main():
 
     # Create conditional UNet
     conditional_unet = ConditionalUNet(
-        hidden_dims=[32, 64, 128],
+        hidden_dims=[128, 256, 512, 256, 128],
         num_classes=len(class_names)  # 2 classes (cat/dog)
     ).to(device)
 
@@ -1419,9 +1419,10 @@ def main():
 
             # Create diffusion model
             diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device)
-            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=5e-4)
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=5
+            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-2)
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, max_lr=1e-3, total_steps=num_epochs * len(train_loader),
+                pct_start=0.1  # Warm-up for 10% of training
             )
 
             # Training loop
@@ -1477,7 +1478,7 @@ def main():
 
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            autoencoder, conditional_unet, num_epochs=200, lr=1e-3,
+            autoencoder, conditional_unet, num_epochs=500, lr=1e-3,
             visualize_every=5,  # Visualize every 5 epochs
             save_dir=results_dir
         )
@@ -1519,6 +1520,9 @@ def main():
     for i, path in enumerate(denoising_paths):
         print(f"  - {class_names[i]}: {path}")
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
