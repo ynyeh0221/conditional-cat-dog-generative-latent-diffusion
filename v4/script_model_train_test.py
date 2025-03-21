@@ -977,7 +977,8 @@ def generate_samples_grid(vae, diffusion, n_per_class=5, save_dir="./results"):
         # Decode samples
         with torch.no_grad():
             samples_flat = samples.view(n_per_class, -1)
-            decoded = vae.decode(samples_flat)
+            samples_flat = reshape_latent_for_decoder(samples_flat, expected_dim=512)
+            decoded = vae.decoder(samples_flat, None)
 
         # Plot samples (starting from column 1, as column 0 is for class names)
         for j in range(n_per_class):
@@ -1061,7 +1062,23 @@ def visualize_denoising_steps(vae, diffusion, class_idx, save_path=None):
             if len(latents.shape) > 2:
                 latents = latents.view(latents.size(0), -1)
 
-            all_latents.append(latents.detach().cpu().numpy())
+            # Reshape latents to expected PCA dimensions (512)
+            latents_reshaped = []
+            for lat in latents:
+                lat_np = lat.detach().cpu().numpy()
+                if len(lat_np.shape) > 1:
+                    lat_np = lat_np.flatten()
+
+                # Ensure 512 dimensions
+                if lat_np.shape[0] < 512:
+                    padding = np.zeros(512 - lat_np.shape[0])
+                    lat_np = np.concatenate([lat_np, padding])
+                elif lat_np.shape[0] > 512:
+                    lat_np = lat_np[:512]
+
+                latents_reshaped.append(lat_np)
+
+            all_latents.append(np.vstack(latents_reshaped))
             all_labels.append(labels.numpy())
 
     # Combine batches
@@ -1100,21 +1117,50 @@ def visualize_denoising_steps(vae, diffusion, class_idx, save_path=None):
                 current_x = diffusion.p_sample(current_x, torch.tensor([time_step], device=device), class_tensor)
 
             # Store the latent vector for the first sample for path visualization
-            path_latents.append(current_x[0:1].view(1, -1).detach().cpu().numpy())
+            flat_latent = current_x[0:1].view(1, -1).detach().cpu().numpy()
+
+            # Pad or truncate to match PCA expected dimensions
+            if flat_latent.shape[1] != 512:
+                if flat_latent.shape[1] < 512:
+                    # Pad with zeros
+                    padding = np.zeros((1, 512 - flat_latent.shape[1]))
+                    flat_latent = np.concatenate([flat_latent, padding], axis=1)
+                else:
+                    # Truncate
+                    flat_latent = flat_latent[:, :512]
+
+            path_latents.append(flat_latent)
 
             # Decode to images
             current_x_flat = current_x.view(n_samples, -1)
-            decoded = vae.decode(current_x_flat)
+            # Reshape to match decoder's expected dimensions
+            decoder_in_dim = vae.decoder.latent_proj[0].in_features
+            if current_x_flat.size(1) != decoder_in_dim:
+                if current_x_flat.size(1) < decoder_in_dim:
+                    padding = torch.zeros(n_samples, decoder_in_dim - current_x_flat.size(1), device=device)
+                    current_x_flat = torch.cat([current_x_flat, padding], dim=1)
+                else:
+                    current_x_flat = current_x_flat[:, :decoder_in_dim]
 
-            # Handle decoder that might return multiple values
-            if isinstance(decoded, tuple):
-                decoded = decoded[0]  # Take first element as reconstructed image
+            # Use decoder directly with no skip connections
+            decoded = vae.decoder(current_x_flat, None)
 
             # Add to samples
             samples_per_step.append(decoded.cpu())
 
         # Add final denoised state to path
-        path_latents.append(current_x[0:1].view(1, -1).detach().cpu().numpy())
+        flat_latent = current_x[0:1].view(1, -1).detach().cpu().numpy()
+        # Pad or truncate to match PCA expected dimensions
+        if flat_latent.shape[1] != 512:
+            if flat_latent.shape[1] < 512:
+                # Pad with zeros
+                padding = np.zeros((1, 512 - flat_latent.shape[1]))
+                flat_latent = np.concatenate([flat_latent, padding], axis=1)
+            else:
+                # Truncate
+                flat_latent = flat_latent[:, :512]
+
+        path_latents.append(flat_latent)
 
     # Stack path latents
     path_latents = np.vstack(path_latents)
@@ -1387,6 +1433,41 @@ def visualize_latent_space(vae, epoch, save_dir="./results"):
     vae.train()
 
 
+def reshape_latent_for_decoder(z, expected_dim=512):
+    """
+    Reshape latent vector to match the decoder's expected dimensions.
+
+    Args:
+        z: Input latent vector
+        expected_dim: Expected latent dimension for the decoder
+
+    Returns:
+        Reshaped latent vector
+    """
+    batch_size = z.size(0)
+
+    # Check if z is already in the right shape
+    if len(z.shape) == 2 and z.size(1) == expected_dim:
+        return z
+
+    # If z is spatial (e.g., 3x8x8), flatten it first
+    if len(z.shape) > 2:
+        z = z.view(batch_size, -1)
+
+    current_dim = z.size(1)
+
+    # If dimensions match, return as is
+    if current_dim == expected_dim:
+        return z
+
+    # If z is smaller than expected, pad with zeros
+    if current_dim < expected_dim:
+        padding = torch.zeros(batch_size, expected_dim - current_dim, device=z.device)
+        return torch.cat([z, padding], dim=1)
+
+    # If z is larger than expected, truncate
+    return z[:, :expected_dim]
+
 # Function to generate samples of a specific class (need this for training)
 def generate_class_samples(vae, diffusion, target_class, num_samples=5, save_path=None):
     """
@@ -1426,7 +1507,8 @@ def generate_class_samples(vae, diffusion, target_class, num_samples=5, save_pat
 
         # Decode latents to images
         latent_samples_flat = latent_samples.view(num_samples, -1)
-        samples = vae.decode(latent_samples_flat)
+        latent_samples_flat = reshape_latent_for_decoder(latent_samples_flat, expected_dim=512)
+        samples = vae.decoder(latent_samples_flat, None)
 
     # Save samples if path provided
     if save_path:
@@ -1554,7 +1636,7 @@ def create_diffusion_animation(vae, diffusion, class_idx, num_frames=50, seed=42
                 current_x = torch.sqrt(alpha_bar_t) * current_x + torch.sqrt(1 - alpha_bar_t) * eps
 
             # Decode to image
-            current_x_flat = current_x.view(1, -1)
+            current_x_flat = reshape_latent_for_decoder(current_x.view(1, -1), expected_dim=512)
             decoded = vae.decode(current_x_flat)
 
             # Convert to numpy for saving
@@ -1790,12 +1872,12 @@ def main():
         vae, ae_losses = train_vae(
             vae,
             train_loader,  # Add this parameter
-            num_epochs=60,
+            num_epochs=4,
             lr=1e-4,
             lambda_cls=0.2,
             lambda_center=0.5,
             lambda_kl=5,
-            visualize_every=15,
+            visualize_every=4,
             save_dir=results_dir
         )
 
@@ -1932,8 +2014,8 @@ def main():
 
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            vae, conditional_unet, num_epochs=200, lr=1e-3,
-            visualize_every=10,  # Visualize every 5 epochs
+            vae, conditional_unet, num_epochs=4, lr=1e-3,
+            visualize_every=4,  # Visualize every 5 epochs
             save_dir=results_dir
         )
 
