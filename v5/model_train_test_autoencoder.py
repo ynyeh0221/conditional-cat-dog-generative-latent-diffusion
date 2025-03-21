@@ -300,8 +300,9 @@ class Swish(nn.Module):
 
 
 # Time embedding for diffusion model
+# Revised TimeEmbedding for flat latent space
 class TimeEmbedding(nn.Module):
-    def __init__(self, n_channels=16):
+    def __init__(self, n_channels=128):
         super().__init__()
         self.n_channels = n_channels
         self.lin1 = nn.Linear(self.n_channels, self.n_channels)
@@ -316,13 +317,18 @@ class TimeEmbedding(nn.Module):
         emb = t[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=1)
 
+        # Make sure emb has the right dimension
+        if emb.shape[1] < self.n_channels:
+            padding = torch.zeros(emb.shape[0], self.n_channels - emb.shape[1], device=emb.device)
+            emb = torch.cat([emb, padding], dim=1)
+
         # Process through MLP
         return self.lin2(self.act(self.lin1(emb)))
 
 
-# Class embedding for conditional diffusion
+# Revised ClassEmbedding for flat latent space
 class ClassEmbedding(nn.Module):
-    def __init__(self, num_classes=2, n_channels=16):
+    def __init__(self, num_classes=2, n_channels=128):
         super().__init__()
         self.embedding = nn.Embedding(num_classes, n_channels)
         self.lin1 = nn.Linear(n_channels, n_channels)
@@ -332,7 +338,7 @@ class ClassEmbedding(nn.Module):
     def forward(self, c):
         # Get class embeddings
         emb = self.embedding(c)
-        # Process through MLP (same structure as time embedding)
+        # Process through MLP
         return self.lin2(self.act(self.lin1(emb)))
 
 
@@ -438,23 +444,33 @@ class SwitchSequential(nn.Sequential):
 
 # Class-Conditional UNet for noise prediction
 # Class-Conditional UNet modified for flat latent space
+# Revised ConditionalUNet for flat latent space with proper dimension handling
 class ConditionalUNet(nn.Module):
-    def __init__(self, latent_dim=128, hidden_dims=[256, 512], num_classes=2, dropout_rate=0.2):
+    def __init__(self, latent_dim=128, hidden_dims=[256, 512, 256], time_emb_dim=128, num_classes=2, dropout_rate=0.2):
         super().__init__()
+        self.latent_dim = latent_dim
 
-        # Time embedding
-        self.time_emb = TimeEmbedding(n_channels=hidden_dims[0])
+        # Use consistent embedding dimension for time and class
+        self.time_emb_dim = time_emb_dim
 
-        # Class embedding
-        self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=hidden_dims[0])
+        # Time embedding with fixed dimension
+        self.time_emb = TimeEmbedding(n_channels=time_emb_dim)
+
+        # Class embedding with same dimension
+        self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=time_emb_dim)
 
         # Initial projection from latent space to first hidden layer
         self.latent_proj = nn.Linear(latent_dim, hidden_dims[0])
 
-        # MLP-based diffusion model for flat latent space
+        # Time/class embedding projections for each layer
+        self.time_projections = nn.ModuleList()
+        for dim in hidden_dims:
+            self.time_projections.append(nn.Linear(time_emb_dim, dim))
+
+        # MLP-based layers
         self.layers = nn.ModuleList()
 
-        # Build layers
+        # Build hidden layers
         for i in range(len(hidden_dims) - 1):
             self.layers.append(
                 nn.ModuleList([
@@ -479,35 +495,45 @@ class ConditionalUNet(nn.Module):
         # c is the optional class label
 
         # Time embedding
-        t_emb = self.time_emb(t)
+        t_emb_base = self.time_emb(t)
 
         # Class embedding (if provided)
-        c_emb = None
+        c_emb_base = None
         if c is not None:
-            c_emb = self.class_emb(c)
+            c_emb_base = self.class_emb(c)
 
         # Initial projection
         h = self.latent_proj(x)
 
-        # Time conditioning
-        h = h + t_emb
+        # Process through layers with proper projection of embeddings
+        for i, (residual, downsample) in enumerate(self.layers):
+            # Project time embedding to current hidden dimension
+            t_emb = self.time_projections[i](t_emb_base)
 
-        # Class conditioning (if provided)
-        if c_emb is not None:
-            h = h + c_emb
-
-        # Process through layers
-        for residual, downsample in self.layers:
-            # Apply residual block
-            h = h + residual(h)
-            # Apply downsampling (projection to next dimension)
-            h = downsample(h)
-            # Add time and class conditioning at each layer
+            # Add time conditioning
             h = h + t_emb
-            if c_emb is not None:
+
+            # Add class conditioning if provided
+            if c_emb_base is not None:
+                # Project class embedding to same dimension as time embedding
+                c_emb = self.time_projections[i](c_emb_base)
                 h = h + c_emb
 
-        # Final projection
+            # Apply residual block
+            h = h + residual(h)
+
+            # Apply projection to next dimension
+            h = downsample(h)
+
+        # Final time and class embedding addition
+        t_emb_final = self.time_projections[-1](t_emb_base)
+        h = h + t_emb_final
+
+        if c_emb_base is not None:
+            c_emb_final = self.time_projections[-1](c_emb_base)
+            h = h + c_emb_final
+
+        # Final projection back to latent dimension
         return self.final(h)
 
 
@@ -1334,7 +1360,7 @@ def main():
         autoencoder, ae_losses = train_autoencoder(
             autoencoder,
             train_loader,  # Add this parameter
-            num_epochs=5,
+            num_epochs=150,
             lr=1e-4,
             lambda_cls=5.0,
             lambda_center=2.0,
@@ -1384,7 +1410,8 @@ def main():
         conditional_unet.apply(init_weights)
 
         # Define train function
-        def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10, save_dir=results_dir):
+        def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
+                                        save_dir=results_dir):
             print("Starting Class-Conditional Diffusion Model training...")
             os.makedirs(save_dir, exist_ok=True)
 
@@ -1407,11 +1434,10 @@ def main():
                     data = data.to(device)
                     labels = labels.to(device)
 
-                    # Encode images to latent space
+                    # Encode images to latent space - now getting flat latent vectors directly
                     with torch.no_grad():
                         latents = autoencoder.encode(data)
-                        # Reshape latents to spatial form [B, 3, 8, 8]
-                        latents = latents.view(-1, 3, 8, 8)  # 3 channels for RGB
+                        # No reshaping needed - latents are already flat vectors [B, latent_dim]
 
                     # Calculate diffusion loss with class conditioning
                     loss = diffusion.loss(latents, labels)
@@ -1439,7 +1465,8 @@ def main():
                         create_diffusion_animation(autoencoder, diffusion, class_idx=class_idx, num_frames=50,
                                                    save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif")
                         save_path = f"{save_dir}/sample_class_{class_names[class_idx]}_epoch_{epoch + 1}.png"
-                        generate_class_samples(autoencoder, diffusion, target_class=class_idx, num_samples=5, save_path=save_path)
+                        generate_class_samples(autoencoder, diffusion, target_class=class_idx, num_samples=5,
+                                               save_path=save_path)
                         save_path = f"{save_dir}/denoising_path_{class_names[class_idx]}_epoch_{epoch + 1}.png"
                         visualize_denoising_steps(autoencoder, diffusion, class_idx=class_idx, save_path=save_path)
 
@@ -1450,7 +1477,7 @@ def main():
 
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            autoencoder, conditional_unet, num_epochs=5, lr=1e-3,
+            autoencoder, conditional_unet, num_epochs=200, lr=1e-3,
             visualize_every=5,  # Visualize every 5 epochs
             save_dir=results_dir
         )
