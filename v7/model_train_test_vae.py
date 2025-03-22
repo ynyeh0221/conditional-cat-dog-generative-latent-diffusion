@@ -12,6 +12,7 @@ from tqdm.auto import tqdm
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import imageio
+from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
@@ -27,7 +28,7 @@ transform = transforms.Compose([
 ])
 
 # Batch size for training
-batch_size = 256
+batch_size = 128
 
 # Define class names for CIFAR cats and dogs
 class_names = ['Cat', 'Dog']
@@ -502,13 +503,11 @@ class SwitchSequential(nn.Sequential):
         return x
 
 
-# Class-Conditional UNet for noise prediction
-# Class-Conditional UNet modified for flat latent space
-# Revised ConditionalUNet for flat latent space with proper dimension handling
+# Class-Conditional UNet modified for 256-dim latent space
 class ConditionalUNet(nn.Module):
-    def __init__(self, latent_dim=128, hidden_dims=[256, 512, 256], time_emb_dim=128, num_classes=2, dropout_rate=0.3):
+    def __init__(self, latent_dim=256, hidden_dims=[256, 512, 256], time_emb_dim=128, num_classes=2, dropout_rate=0.3):
         super().__init__()
-        self.latent_dim = latent_dim
+        self.latent_dim = latent_dim  # Changed from 128 to 256
 
         # Use consistent embedding dimension for time and class
         self.time_emb_dim = time_emb_dim
@@ -520,7 +519,7 @@ class ConditionalUNet(nn.Module):
         self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=time_emb_dim)
 
         # Initial projection from latent space to first hidden layer
-        self.latent_proj = nn.Linear(latent_dim, hidden_dims[0])
+        self.latent_proj = nn.Linear(latent_dim, hidden_dims[0])  # Input dim changed to 256
 
         # Time/class embedding projections for each layer
         self.time_projections = nn.ModuleList()
@@ -546,8 +545,8 @@ class ConditionalUNet(nn.Module):
                 ])
             )
 
-        # Final layer projecting back to latent dimension
-        self.final = nn.Linear(hidden_dims[-1], latent_dim)
+        # Final layer projecting back to latent dimension - OUTPUT ALSO CHANGED TO 256
+        self.final = nn.Linear(hidden_dims[-1], latent_dim)  # Output dim changed to 256
 
     def forward(self, x, t, c=None):
         # x is the noisy latent vector: [batch_size, latent_dim]
@@ -1373,11 +1372,43 @@ def main():
             device = next(autoencoder.parameters()).device
 
             # Create optimizers - don't share parameters between optimizers
-            recon_optimizer = optim.Adam(list(autoencoder.encoder.parameters()) +
-                                         list(autoencoder.decoder.parameters()), lr=lr)
+            recon_optimizer = optim.AdamW(
+                list(autoencoder.encoder.parameters()) +
+                list(autoencoder.decoder.parameters()),
+                lr=lr,
+                weight_decay=1e-5  # Add weight decay for regularization
+            )
 
-            class_optimizer = optim.Adam(list(autoencoder.classifier.parameters()) +
-                                         list(autoencoder.center_loss.parameters()), lr=lr * 5)
+            class_optimizer = optim.AdamW(
+                list(autoencoder.classifier.parameters()) +
+                list(autoencoder.center_loss.parameters()),
+                lr=lr * 5,  # Keep the higher learning rate for classifier
+                weight_decay=1e-5  # Same weight decay
+            )
+
+            # Create learning rate schedulers with warmup
+            total_steps = len(train_loader) * num_epochs
+
+            # OneCycleLR provides both warmup and annealing
+            recon_scheduler = OneCycleLR(
+                recon_optimizer,
+                max_lr=lr,
+                total_steps=total_steps,
+                pct_start=0.05,  # 5% of training for warmup
+                anneal_strategy='cos',  # Cosine annealing after warmup
+                div_factor=25.0,  # Initial lr = max_lr/25
+                final_div_factor=10000.0  # Final lr = initial_lr/10000
+            )
+
+            class_scheduler = OneCycleLR(
+                class_optimizer,
+                max_lr=lr * 5,  # Keep the 5x multiplier for classifier
+                total_steps=total_steps,
+                pct_start=0.05,
+                anneal_strategy='cos',
+                div_factor=25.0,
+                final_div_factor=10000.0
+            )
 
             loss_history = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': []}
 
@@ -1412,7 +1443,12 @@ def main():
 
                     # Backward pass for reconstruction path
                     total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        list(autoencoder.encoder.parameters()) + list(autoencoder.decoder.parameters()),
+                        max_norm=0.5
+                    )
                     recon_optimizer.step()
+                    recon_scheduler.step()  # Step the scheduler after each batch
 
                     # Step 2: Classification optimization
                     class_optimizer.zero_grad()
@@ -1430,11 +1466,13 @@ def main():
                     # Combined classification loss
                     total_class_loss = lambda_cls * class_loss + lambda_center * center_loss
                     total_class_loss.backward()
-
-                    # Add gradient clipping here, before optimizer step
-                    torch.nn.utils.clip_grad_norm_(autoencoder.classifier.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        list(autoencoder.classifier.parameters()) + list(autoencoder.center_loss.parameters()),
+                        max_norm=0.5
+                    )
 
                     class_optimizer.step()
+                    class_scheduler.step()  # Step the scheduler after each batch
 
                     # Record losses
                     epoch_recon_loss += recon_loss.item()
@@ -1480,11 +1518,11 @@ def main():
         autoencoder, ae_losses = train_autoencoder(
             autoencoder,
             train_loader,  # Add this parameter
-            num_epochs=500,
+            num_epochs=800,
             lr=1e-4,
             lambda_cls=5.0,
             lambda_center=2.0,
-            visualize_every=50,
+            visualize_every=100,
             save_dir=results_dir
         )
 
