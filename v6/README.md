@@ -73,7 +73,7 @@ The model includes several visualization functions:
 
 After training, you can expect:
 
-- Clear separation between cat and dog representations in the latent space
+- Cat and dog representations in the latent space
 - High-quality reconstructions of input images
 - Realistic generated samples of both cats and dogs
 - Smooth denoising animations showing the generation process
