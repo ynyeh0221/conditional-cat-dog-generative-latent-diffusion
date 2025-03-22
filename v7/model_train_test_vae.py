@@ -1480,11 +1480,11 @@ def main():
         autoencoder, ae_losses = train_autoencoder(
             autoencoder,
             train_loader,  # Add this parameter
-            num_epochs=300,
+            num_epochs=500,
             lr=1e-4,
             lambda_cls=5.0,
             lambda_center=2.0,
-            visualize_every=5,
+            visualize_every=50,
             save_dir=results_dir
         )
 
@@ -1598,8 +1598,8 @@ def main():
 
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            autoencoder, conditional_unet, num_epochs=800, lr=1e-3,
-            visualize_every=5,  # Visualize every 5 epochs
+            autoencoder, conditional_unet, num_epochs=1000, lr=1e-3,
+            visualize_every=100,  # Visualize every 100 epochs
             save_dir=results_dir
         )
 
