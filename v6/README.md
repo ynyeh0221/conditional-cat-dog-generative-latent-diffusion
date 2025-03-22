@@ -78,21 +78,18 @@ After training, you can expect:
 - Realistic generated samples of both cats and dogs
 - Smooth denoising animations showing the generation process
 
+ Model Component | Visualization | Description |
+|-----------------|---------------|-------------|
+| Autoencoder | ![Reconstructions](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v6/output/reconstruction/vae_reconstruction_epoch_300.png) | Original images (top) and their reconstructions (bottom) |
+| Latent Space | ![Latent Space](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v6/output/latent_space/vae_latent_space_epoch_300.png) | t-SNE visualization of cat and dog latent representations |
+| Class Samples | ![Class Samples](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v6/output/diffusion_result_sample/sample_class_Cat_epoch_100.png)![Class Samples](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v6/output/diffusion_result_sample/sample_class_Dog_epoch_100.png) | Generated samples for cat and dog classes |
+| Denoising Process | ![Denoising Cat](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v6/output/denoising_path_Cat_final.png)![Denoising Dog](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v6/output/denoising_path_Dog_final.png) | Visualization of cat generation process and latent path |
+| Animation | ![Cat Animation](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v6/diffusion_animation_class_Cat_epoch_800.gif)![Dog Animation](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v6/diffusion_animation_class_Dog_epoch_800.gif) | Animation of the denoising process for cat generation |
+
+
 ## Project Structure
 
 - `SimpleAutoencoder`: The VAE implementation with conditioning capabilities
 - `ConditionalUNet`: The noise prediction network for the diffusion model
 - `ConditionalDenoiseDiffusion`: The diffusion process handler
 - Various visualization and utility functions
-
-## Acknowledgements
-
-This model combines techniques from:
-- Variational Autoencoders (Kingma & Welling)
-- Denoising Diffusion Probabilistic Models (Ho et al.)
-- Channel Attention mechanisms
-- Center Loss for better class separation
-
-## License
-
-[Your license information here]
