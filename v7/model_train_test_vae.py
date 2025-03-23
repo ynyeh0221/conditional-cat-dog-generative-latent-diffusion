@@ -1329,13 +1329,13 @@ def vae_loss(x_recon, x, mu, logvar, kl_weight=0.001, reduction='mean'):
     return total_loss, recon_loss, kl_div
 
 # Main function
-def main():
+def main(checkpoint_path=None, total_epochs=10000):
     """Main function to run the entire pipeline non-interactively"""
     print("Starting class-conditional diffusion model for CIFAR cats and dogs")
 
     # Set device
     device = torch.device("mps" if torch.backends.mps.is_available() else
-                         ("cuda" if torch.cuda.is_available() else "cpu"))
+                          ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
 
     # Create results directory
@@ -1558,87 +1558,123 @@ def main():
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    # Check if trained diffusion model exists
-    if os.path.exists(diffusion_path):
+    # Extract epoch number from checkpoint path if provided
+    start_epoch = 0
+    # First check the provided checkpoint path, if any
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        # Parse epoch number from filename (assumes format "conditional_diffusion_epoch_X.pt")
+        try:
+            filename = os.path.basename(checkpoint_path)
+            # Extract number between "epoch_" and ".pt"
+            epoch_str = filename.split("epoch_")[1].split(".pt")[0]
+            start_epoch = int(epoch_str)
+            print(f"Continuing training from epoch {start_epoch}")
+
+            # Load the model
+            conditional_unet.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            diffusion = ConditionalDenoiseDiffusion(conditional_unet, n_steps=1000, device=device)
+        except (IndexError, ValueError) as e:
+            print(f"Could not extract epoch number from checkpoint filename: {e}")
+            print("Starting from epoch 0")
+            start_epoch = 0
+    # Then check if standard diffusion path exists
+    elif os.path.exists(diffusion_path):
         print(f"Loading existing diffusion model from {diffusion_path}")
         conditional_unet.load_state_dict(torch.load(diffusion_path, map_location=device))
         diffusion = ConditionalDenoiseDiffusion(conditional_unet, n_steps=1000, device=device)
+    # If no checkpoint found, we'll start from scratch
     else:
         print("No existing diffusion model found. Training a new one...")
         conditional_unet.apply(init_weights)
+        # diffusion variable will be initialized during training
 
-        # Updated train_conditional_diffusion for VAE
-        def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
-                                        save_dir="./results"):
-            print("Starting Class-Conditional Diffusion Model training with VAE...")
-            os.makedirs(save_dir, exist_ok=True)
+    # Updated train_conditional_diffusion for VAE with start_epoch parameter
+    def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
+                                    save_dir="./results", start_epoch=0):
+        print(f"Starting Class-Conditional Diffusion Model training with VAE from epoch {start_epoch + 1}...")
+        os.makedirs(save_dir, exist_ok=True)
 
-            autoencoder.eval()  # Set VAE to evaluation mode
+        autoencoder.eval()  # Set VAE to evaluation mode
 
-            # Create diffusion model
-            diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device)
-            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-2)
-            scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                optimizer, max_lr=1e-3, total_steps=num_epochs * len(train_loader),
-                pct_start=0.1  # Warm-up for 10% of training
-            )
+        # Create diffusion model
+        diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device)
+        optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-2)
 
-            # Training loop
-            loss_history = []
+        # Adjust scheduler to account for starting epoch
+        total_steps = num_epochs * len(train_loader)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=1e-3, total_steps=total_steps,
+            pct_start=0.1  # Warm-up for 10% of training
+        )
 
-            for epoch in range(num_epochs):
-                epoch_loss = 0
-
-                for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
-                    data = data.to(device)
-                    labels = labels.to(device)
-
-                    # Encode images to latent space using VAE
-                    with torch.no_grad():
-                        # Use the sample from encoding function
-                        latents = autoencoder.encode(data)
-
-                    # Calculate diffusion loss with class conditioning
-                    loss = diffusion.loss(latents, labels)
-
-                    # Backward pass
-                    optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
-                    optimizer.step()
-
-                    epoch_loss += loss.item()
-
-                # Calculate average loss
-                avg_loss = epoch_loss / len(train_loader)
-                loss_history.append(avg_loss)
-                print(f"Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.6f}")
-
-                # Learning rate scheduling
+        # If we're starting from a later epoch, we need to adjust the scheduler
+        if start_epoch > 0:
+            for _ in range(start_epoch * len(train_loader)):
                 scheduler.step()
 
-                # Visualize samples periodically
-                if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
-                    # Generate samples for both classes
-                    for class_idx in range(len(class_names)):
-                        create_diffusion_animation(autoencoder, diffusion, class_idx=class_idx, num_frames=50,
-                                                   save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif")
-                        save_path = f"{save_dir}/sample_class_{class_names[class_idx]}_epoch_{epoch + 1}.png"
-                        generate_class_samples(autoencoder, diffusion, target_class=class_idx, num_samples=5,
-                                               save_path=save_path)
-                        save_path = f"{save_dir}/denoising_path_{class_names[class_idx]}_epoch_{epoch + 1}.png"
-                        visualize_denoising_steps(autoencoder, diffusion, class_idx=class_idx, save_path=save_path)
+        # Training loop
+        loss_history = []
 
-                    # Save checkpoint
-                    torch.save(unet.state_dict(), f"{save_dir}/conditional_diffusion_epoch_{epoch + 1}.pt")
+        for epoch in range(start_epoch, start_epoch + num_epochs):  # Adjust epoch range
+            epoch_loss = 0
 
-            return unet, diffusion, loss_history
+            for batch_idx, (data, labels) in enumerate(
+                    tqdm(train_loader, desc=f"Epoch {epoch + 1}/{start_epoch + num_epochs}")):
+                data = data.to(device)
+                labels = labels.to(device)
 
+                # Encode images to latent space using VAE
+                with torch.no_grad():
+                    # Use the sample from encoding function
+                    latents = autoencoder.encode(data)
+
+                # Calculate diffusion loss with class conditioning
+                loss = diffusion.loss(latents, labels)
+
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+                optimizer.step()
+
+                epoch_loss += loss.item()
+
+            # Calculate average loss
+            avg_loss = epoch_loss / len(train_loader)
+            loss_history.append(avg_loss)
+            print(f"Epoch {epoch + 1}/{start_epoch + num_epochs}, Average Loss: {avg_loss:.6f}")
+
+            # Learning rate scheduling
+            scheduler.step()
+
+            # Visualize samples periodically
+            if (epoch + 1) % visualize_every == 0 or epoch == start_epoch + num_epochs - 1:
+                # Generate samples for both classes
+                for class_idx in range(len(class_names)):
+                    create_diffusion_animation(autoencoder, diffusion, class_idx=class_idx, num_frames=50,
+                                               save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif")
+                    save_path = f"{save_dir}/sample_class_{class_names[class_idx]}_epoch_{epoch + 1}.png"
+                    generate_class_samples(autoencoder, diffusion, target_class=class_idx, num_samples=5,
+                                           save_path=save_path)
+                    save_path = f"{save_dir}/denoising_path_{class_names[class_idx]}_epoch_{epoch + 1}.png"
+                    visualize_denoising_steps(autoencoder, diffusion, class_idx=class_idx, save_path=save_path)
+
+                # Save checkpoint
+                torch.save(unet.state_dict(), f"{save_dir}/conditional_diffusion_epoch_{epoch + 1}.pt")
+
+        return unet, diffusion, loss_history
+
+    # Calculate remaining epochs
+    remaining_epochs = total_epochs - start_epoch
+
+    # If no diffusion model is loaded, train a new one
+    if 'diffusion' not in locals():
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            autoencoder, conditional_unet, num_epochs=10000, lr=1e-3,
-            visualize_every=500,  # Visualize every 100 epochs
-            save_dir=results_dir
+            autoencoder, conditional_unet, num_epochs=remaining_epochs, lr=1e-3,
+            visualize_every=500,  # Visualize every 500 epochs
+            save_dir=results_dir,
+            start_epoch=start_epoch  # Pass the start epoch
         )
 
         # Save diffusion model
@@ -1646,17 +1682,35 @@ def main():
 
         # Plot diffusion loss
         plt.figure(figsize=(8, 5))
-        plt.plot(diff_losses)
+        plt.plot(range(start_epoch + 1, start_epoch + len(diff_losses) + 1), diff_losses)  # Adjust x-axis for plot
         plt.title('Diffusion Model Training Loss')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.grid(True)
         plt.savefig(f"{results_dir}/diffusion_loss.png")
         plt.close()
+    # If we loaded a model but want to continue training
+    elif start_epoch > 0:
+        # Continue training from the loaded checkpoint
+        conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
+            autoencoder, conditional_unet, num_epochs=remaining_epochs, lr=1e-3,
+            visualize_every=500,  # Visualize every 500 epochs
+            save_dir=results_dir,
+            start_epoch=start_epoch  # Pass the start epoch
+        )
 
-    # Make sure diffusion is defined
-    if 'diffusion' not in locals():
-        diffusion = ConditionalDenoiseDiffusion(conditional_unet, n_steps=1000, device=device)
+        # Save diffusion model
+        torch.save(conditional_unet.state_dict(), diffusion_path)
+
+        # Plot diffusion loss
+        plt.figure(figsize=(8, 5))
+        plt.plot(range(start_epoch + 1, start_epoch + len(diff_losses) + 1), diff_losses)  # Adjust x-axis for plot
+        plt.title('Diffusion Model Training Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.grid(True)
+        plt.savefig(f"{results_dir}/diffusion_loss_continued.png")
+        plt.close()
 
     # Generate sample grid for all classes
     print("Generating sample grid for both cat and dog classes...")
@@ -1680,4 +1734,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(checkpoint_path="./cifar_cat_dog_conditional_v7/conditional_diffusion_epoch_1000.pt", total_epochs=10000)
