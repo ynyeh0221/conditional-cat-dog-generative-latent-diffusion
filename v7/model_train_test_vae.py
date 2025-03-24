@@ -548,10 +548,10 @@ class ConditionalUNet(nn.Module):
         # Final layer projecting back to latent dimension - OUTPUT ALSO CHANGED TO 256
         self.final = nn.Linear(hidden_dims[-1], latent_dim)  # Output dim changed to 256
 
+        self.residual_alpha = nn.Parameter(torch.tensor(1.0))
+
     def forward(self, x, t, c=None):
-        # x is the noisy latent vector: [batch_size, latent_dim]
-        # t is the diffusion timestep
-        # c is the optional class label
+        original_x = x
 
         # Time embedding
         t_emb_base = self.time_emb(t)
@@ -592,23 +592,44 @@ class ConditionalUNet(nn.Module):
             c_emb_final = self.time_projections[-1](c_emb_base)
             h = h + c_emb_final
 
-        # Final projection back to latent dimension
-        return self.final(h)
+        final_output = self.final(h)
 
+        normalized_residual = F.normalize(original_x, p=2, dim=1)
+
+        alpha = 0.6
+
+        return final_output + self.residual_alpha * normalized_residual
+
+
+def cosine_beta_schedule(timesteps, s=0.008):
+    """Cosine schedule as proposed in https://arxiv.org/abs/2102.09672"""
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0.0001, 0.9999)
 
 # Class-conditional diffusion model
 # Modified diffusion model for flat latent space
 class ConditionalDenoiseDiffusion():
-    def __init__(self, eps_model, n_steps=1000, device=None):
+    # Modified ConditionalDenoiseDiffusion.__init__ function
+    def __init__(self, eps_model, n_steps=1000, device=None, use_linear=True):
         super().__init__()
         self.eps_model = eps_model
         self.device = device
+        self.n_steps = n_steps
 
-        # Linear beta schedule
-        self.beta = torch.linspace(0.0001, 0.02, n_steps).to(device)
+        # Choose schedule based on parameter
+        if use_linear:
+            # Use original linear schedule when loading from checkpoint
+            self.beta = create_linear_schedule(n_steps, device)
+        else:
+            # Use cosine schedule for new models
+            self.beta = cosine_beta_schedule(n_steps).to(device)
+
         self.alpha = 1 - self.beta
         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-        self.n_steps = n_steps
 
     def q_sample(self, x0, t, eps=None):
         """Forward diffusion process: add noise to data"""
@@ -618,14 +639,23 @@ class ConditionalDenoiseDiffusion():
         alpha_bar_t = self.alpha_bar[t].reshape(-1, 1)
         return torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * eps
 
-    def p_sample(self, xt, t, c=None):
-        """Single denoising step with optional class conditioning"""
+    def p_sample(self, xt, t, c=None, guidance_scale=3.0):
+        """Single denoising step with classifier-free guidance"""
         # Convert time to tensor format expected by model
         if not isinstance(t, torch.Tensor):
             t = torch.tensor([t], device=xt.device)
 
-        # Predict noise (with class conditioning if provided)
-        eps_theta = self.eps_model(xt, t, c)
+        # Classifier-free guidance implementation
+        if c is not None and guidance_scale > 1.0:
+            # Get unconditional prediction (no class information)
+            eps_uncond = self.eps_model(xt, t, None)
+            # Get conditional prediction (with class information)
+            eps_cond = self.eps_model(xt, t, c)
+            # Combine with guidance scale
+            eps_theta = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+        else:
+            # Standard prediction (original code path)
+            eps_theta = self.eps_model(xt, t, c)
 
         # Get alpha values
         alpha_t = self.alpha[t].reshape(-1, 1)
@@ -643,14 +673,14 @@ class ConditionalDenoiseDiffusion():
         else:
             return mean
 
-    def sample(self, shape, device, c=None):
-        """Generate samples by denoising from pure noise with optional class conditioning"""
+    def sample(self, shape, device, c=None, guidance_scale=3.0):
+        """Generate samples with classifier-free guidance"""
         # Start from pure noise
         x = torch.randn(shape, device=device)
 
-        # Progressively denoise with class conditioning
+        # Progressively denoise with guidance
         for t in tqdm(reversed(range(self.n_steps)), desc="Sampling"):
-            x = self.p_sample(x, t, c)
+            x = self.p_sample(x, t, c, guidance_scale=guidance_scale)
 
         return x
 
@@ -672,7 +702,7 @@ class ConditionalDenoiseDiffusion():
 
 
 # Function to generate a grid of samples for all classes
-def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./results"):
+def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./results", guidance_scale=3.0):
     """Generate a grid of samples with n_per_class samples for each class using VAE decoder"""
     os.makedirs(save_dir, exist_ok=True)
     device = next(autoencoder.parameters()).device
@@ -686,7 +716,7 @@ def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./res
     fig, axes = plt.subplots(n_classes, n_per_class + 1, figsize=((n_per_class + 1) * 2, n_classes * 2))
 
     # Add a title to explain what the figure shows
-    fig.suptitle(f'CIFAR Cat and Dog Samples Generated by VAE-Diffusion Model',
+    fig.suptitle(f'CIFAR Cat and Dog Samples Generated by VAE-Diffusion Model (Guidance: {guidance_scale})',
                 fontsize=16, y=0.98)
 
     for i in range(n_classes):
@@ -703,8 +733,8 @@ def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./res
         # Use flat latent shape
         latent_shape = (n_per_class, autoencoder.latent_dim)
 
-        # Sample from the diffusion model with class conditioning
-        samples = diffusion.sample(latent_shape, device, class_tensor)
+        # Sample from the diffusion model with class conditioning and guidance
+        samples = diffusion.sample(latent_shape, device, class_tensor, guidance_scale=guidance_scale)
 
         # Decode samples using VAE decoder
         with torch.no_grad():
@@ -726,26 +756,27 @@ def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./res
     description = (
         "This visualization shows cat and dog images generated by the conditional diffusion model using a VAE decoder.\n"
         "The model creates new, synthetic images based on learned patterns from CIFAR-10.\n"
-        "Each row corresponds to a different animal category as labeled."
+        "Each row corresponds to a different animal category as labeled.\n"
+        f"Classifier-free guidance scale: {guidance_scale} (higher values = stronger class conditioning)"
     )
     plt.figtext(0.5, 0.01, description, ha='center', fontsize=10,
                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.7))
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.92])  # Adjust layout to make room for titles
-    plt.savefig(f"{save_dir}/vae_samples_grid_all_classes.png", dpi=150, bbox_inches='tight')
+    plt.savefig(f"{save_dir}/vae_samples_grid_all_classes_guidance_{guidance_scale:.1f}.png", dpi=150, bbox_inches='tight')
     plt.close()
 
     # Set models back to training mode
     autoencoder.train()
     diffusion.eps_model.train()
 
-    print(f"Generated sample grid for all classes with clearly labeled categories")
-    return f"{save_dir}/vae_samples_grid_all_classes.png"
+    print(f"Generated sample grid for all classes with clearly labeled categories (guidance: {guidance_scale})")
+    return f"{save_dir}/vae_samples_grid_all_classes_guidance_{guidance_scale:.1f}.png"
 
 
 # Visualize latent space denoising process for a specific class
 # Modified visualize_denoising_steps for VAE
-def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None):
+def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None, guidance_scale=3.0):
     """
     Visualize both the denoising process and the corresponding path in latent space for VAE.
 
@@ -754,6 +785,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
         diffusion: Trained diffusion model
         class_idx: Target class index (0-1 for cat/dog)
         save_path: Path to save the visualization
+        guidance_scale: Scale for classifier-free guidance (higher = stronger conditioning)
     """
     device = next(autoencoder.parameters()).device
 
@@ -814,9 +846,10 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
             # Current denoised state
             current_x = x.clone()
 
-            # Denoise from current step to t=0 with class conditioning
+            # Denoise from current step to t=0 with class conditioning and guidance
             for time_step in range(t, -1, -1):
-                current_x = diffusion.p_sample(current_x, torch.tensor([time_step], device=device), class_tensor)
+                current_x = diffusion.p_sample(current_x, torch.tensor([time_step], device=device),
+                                               class_tensor, guidance_scale=guidance_scale)
 
             # Store the latent vector for the first sample for path visualization
             path_latents.append(current_x[0:1].detach().cpu().numpy())
@@ -851,7 +884,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
     grid_cols = len(timesteps)
 
     # Set title for the denoising subplot
-    ax_denoising.set_title(f"VAE-Diffusion Model Denoising Process for {class_names[class_idx]}",
+    ax_denoising.set_title(f"VAE-Diffusion Model Denoising Process for {class_names[class_idx]} (Guidance: {guidance_scale})",
                            fontsize=16, pad=10)
 
     # Hide axis ticks
@@ -960,7 +993,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
         bbox=dict(boxstyle="round,pad=0.5", facecolor='white', alpha=0.8)
     )
 
-    ax_latent.set_title(f"VAE-Diffusion Path in Latent Space for {class_names[class_idx]}", fontsize=16)
+    ax_latent.set_title(f"VAE-Diffusion Path in Latent Space for {class_names[class_idx]} (Guidance: {guidance_scale})", fontsize=16)
     ax_latent.legend(fontsize=10, loc='best')
     ax_latent.grid(True, linestyle='--', alpha=0.7)
 
@@ -1081,9 +1114,9 @@ def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
 
 # Function to generate samples of a specific class (need this for training)
 # Updated generate_class_samples for VAE
-def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, save_path=None):
+def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, save_path=None, guidance_scale=3.0):
     """
-    Generate samples of a specific target class using the VAE decoder
+    Generate samples of a specific target class using the VAE decoder with guidance
 
     Args:
         autoencoder: Trained VAE model
@@ -1091,6 +1124,7 @@ def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, 
         target_class: Index of the target class (0-1) or class name
         num_samples: Number of samples to generate
         save_path: Path to save the generated samples
+        guidance_scale: Scale for classifier-free guidance (higher = stronger conditioning)
 
     Returns:
         Tensor of generated samples
@@ -1114,8 +1148,8 @@ def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, 
     # Generate samples
     latent_shape = (num_samples, autoencoder.latent_dim)
     with torch.no_grad():
-        # Sample from the diffusion model with class conditioning
-        latent_samples = diffusion.sample(latent_shape, device, class_tensor)
+        # Sample from the diffusion model with class conditioning and guidance
+        latent_samples = diffusion.sample(latent_shape, device, class_tensor, guidance_scale=guidance_scale)
 
         # Decode latents to images using VAE decoder
         samples = autoencoder.decode(latent_samples)
@@ -1130,7 +1164,7 @@ def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, 
             plt.axis('off')
             plt.title(f"{class_names[target_class]}")
 
-        plt.suptitle(f"Generated {class_names[target_class]} Samples")
+        plt.suptitle(f"Generated {class_names[target_class]} Samples (Guidance: {guidance_scale})")
         plt.tight_layout()
         plt.savefig(save_path)
         plt.close()
@@ -1140,7 +1174,7 @@ def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, 
 
 # Modified create_diffusion_animation for flat latent space
 def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50, seed=42,
-                               save_path=None, temp_dir=None, fps=10, reverse=False):
+                               save_path=None, temp_dir=None, fps=10, reverse=False, guidance_scale=3.0):
     """
     Create a GIF animation showing the diffusion process.
 
@@ -1154,6 +1188,7 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
         temp_dir: Directory to save temporary frames (will be created if None)
         fps: Frames per second in the output GIF
         reverse: If False (default), show t=0→1000 (image to noise), otherwise t=1000→0 (noise to image)
+        guidance_scale: Scale for classifier-free guidance (higher = stronger conditioning)
 
     Returns:
         Path to the created GIF file
@@ -1214,7 +1249,7 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
         backward_timesteps = sorted(timesteps[1:-1], reverse=True)
         timesteps = timesteps + backward_timesteps
 
-    print(f"Creating diffusion animation for class '{class_names[class_idx]}'...")
+    print(f"Creating diffusion animation for class '{class_names[class_idx]}' with guidance scale {guidance_scale}...")
     frame_paths = []
 
     with torch.no_grad():
@@ -1223,9 +1258,10 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
         # Start from pure noise - now using flat latent dimension
         x = torch.randn((1, autoencoder.latent_dim), device=device)
 
-        # Denoise completely to get clean image at t=0
+        # Denoise completely to get clean image at t=0 with guidance
         for time_step in tqdm(range(total_steps - 1, -1, -1), desc="Denoising"):
-            x = diffusion.p_sample(x, torch.tensor([time_step], device=device), class_tensor)
+            x = diffusion.p_sample(x, torch.tensor([time_step], device=device),
+                                  class_tensor, guidance_scale=guidance_scale)
 
         # Now we have a clean, denoised image at t=0
         clean_x = x.clone()
@@ -1259,7 +1295,7 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
 
             # Add timestep information
             progress = (t / total_steps) * 100
-            title = f'Class: {class_names[class_idx]} (t={t}, {progress:.1f}% noise)'
+            title = f'Class: {class_names[class_idx]} (t={t}, {progress:.1f}% noise, guidance={guidance_scale})'
             ax.set_title(title)
 
             # Save frame
@@ -1327,6 +1363,26 @@ def vae_loss(x_recon, x, mu, logvar, kl_weight=0.001, reduction='mean'):
         total_loss = recon_loss + kl_weight * kl_div
 
     return total_loss, recon_loss, kl_div
+
+
+def create_linear_schedule(n_steps=1000, device=None):
+    """Create the original linear beta schedule for loading checkpoints"""
+    beta = torch.linspace(0.0001, 0.02, n_steps).to(device)
+    return beta
+
+def cosine_beta_schedule(timesteps, s=0.008):
+    """Cosine schedule as proposed in https://arxiv.org/abs/2102.09672"""
+    steps = timesteps + 1
+    x = torch.linspace(0, timesteps, steps)
+    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0.0001, 0.9999)
+
+def blend_schedules(schedule1, schedule2, ratio=0.5):
+    """Blend two beta schedules with the given ratio"""
+    return schedule1 * (1 - ratio) + schedule2 * ratio
+
 
 # Main function
 def main(checkpoint_path=None, total_epochs=10000):
@@ -1571,7 +1627,7 @@ def main(checkpoint_path=None, total_epochs=10000):
             print(f"Continuing training from epoch {start_epoch}")
 
             # Load the model
-            conditional_unet.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            conditional_unet.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
             diffusion = ConditionalDenoiseDiffusion(conditional_unet, n_steps=1000, device=device)
         except (IndexError, ValueError) as e:
             print(f"Could not extract epoch number from checkpoint filename: {e}")
@@ -1590,34 +1646,70 @@ def main(checkpoint_path=None, total_epochs=10000):
 
     # Updated train_conditional_diffusion for VAE with start_epoch parameter
     def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
-                                    save_dir="./results", start_epoch=0):
+                                    save_dir="./results", start_epoch=0, transition_epochs=[150, 300]):
+        """
+        Train the conditional diffusion model with schedule transitions.
+
+        Args:
+            autoencoder: Trained VAE model
+            unet: UNet denoising model
+            num_epochs: Number of epochs to train
+            lr: Learning rate
+            visualize_every: Epochs between visualizations
+            save_dir: Directory to save results
+            start_epoch: Starting epoch number (if continuing from checkpoint)
+            transition_epochs: When to transition to cosine schedule [blend_point, full_cosine_point]
+        """
         print(f"Starting Class-Conditional Diffusion Model training with VAE from epoch {start_epoch + 1}...")
         os.makedirs(save_dir, exist_ok=True)
 
         autoencoder.eval()  # Set VAE to evaluation mode
 
-        # Create diffusion model
-        diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device)
-        optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-2)
+        # Create diffusion model with initial linear schedule for continuing from checkpoint
+        diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device, use_linear=True)
 
-        # Adjust scheduler to account for starting epoch
-        total_steps = num_epochs * len(train_loader)
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=1e-3, total_steps=total_steps,
-            pct_start=0.1  # Warm-up for 10% of training
+        # Create optimizer and warm restart scheduler
+        optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-2)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=50,  # Restart every 50 epochs
+            T_mult=2,  # Double period after each restart
+            eta_min=1e-6
         )
 
-        # If we're starting from a later epoch, we need to adjust the scheduler
+        # Step scheduler to match start_epoch
         if start_epoch > 0:
-            for _ in range(start_epoch * len(train_loader)):
+            for _ in range(start_epoch):
                 scheduler.step()
+
+        # Create cosine schedule for later transition
+        cosine_beta = cosine_beta_schedule(diffusion.n_steps).to(device)
 
         # Training loop
         loss_history = []
 
-        for epoch in range(start_epoch, start_epoch + num_epochs):  # Adjust epoch range
+        for epoch in range(start_epoch, start_epoch + num_epochs):
             epoch_loss = 0
 
+            # Schedule transition logic
+            current_epoch_in_continuation = epoch - start_epoch
+
+            # First transition - blend linear and cosine schedules
+            if transition_epochs[0] is not None and current_epoch_in_continuation == transition_epochs[0]:
+                print(f"Epoch {epoch + 1}: Transitioning to blended beta schedule (50% cosine)...")
+                linear_beta = diffusion.beta.clone()
+                diffusion.beta = blend_schedules(linear_beta, cosine_beta, ratio=0.5)
+                diffusion.alpha = 1 - diffusion.beta
+                diffusion.alpha_bar = torch.cumprod(diffusion.alpha, dim=0)
+
+            # Second transition - full cosine schedule
+            elif transition_epochs[1] is not None and current_epoch_in_continuation == transition_epochs[1]:
+                print(f"Epoch {epoch + 1}: Completing transition to full cosine beta schedule...")
+                diffusion.beta = cosine_beta.clone()
+                diffusion.alpha = 1 - diffusion.beta
+                diffusion.alpha_bar = torch.cumprod(diffusion.alpha, dim=0)
+
+            # Normal training loop
             for batch_idx, (data, labels) in enumerate(
                     tqdm(train_loader, desc=f"Epoch {epoch + 1}/{start_epoch + num_epochs}")):
                 data = data.to(device)
@@ -1625,7 +1717,6 @@ def main(checkpoint_path=None, total_epochs=10000):
 
                 # Encode images to latent space using VAE
                 with torch.no_grad():
-                    # Use the sample from encoding function
                     latents = autoencoder.encode(data)
 
                 # Calculate diffusion loss with class conditioning
@@ -1652,29 +1743,46 @@ def main(checkpoint_path=None, total_epochs=10000):
                 # Generate samples for both classes
                 for class_idx in range(len(class_names)):
                     create_diffusion_animation(autoencoder, diffusion, class_idx=class_idx, num_frames=50,
-                                               save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif")
+                                               save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif",
+                                               guidance_scale=3.0)
+
                     save_path = f"{save_dir}/sample_class_{class_names[class_idx]}_epoch_{epoch + 1}.png"
                     generate_class_samples(autoencoder, diffusion, target_class=class_idx, num_samples=5,
-                                           save_path=save_path)
+                                           save_path=save_path, guidance_scale=3.0)
+
                     save_path = f"{save_dir}/denoising_path_{class_names[class_idx]}_epoch_{epoch + 1}.png"
-                    visualize_denoising_steps(autoencoder, diffusion, class_idx=class_idx, save_path=save_path)
+                    visualize_denoising_steps(autoencoder, diffusion, class_idx=class_idx, save_path=save_path,
+                                              guidance_scale=3.0)
+
+                # Save current schedule information
+                if epoch + 1 == start_epoch + transition_epochs[0] or epoch + 1 == start_epoch + transition_epochs[1]:
+                    schedule_type = "50_percent_cosine" if epoch + 1 == start_epoch + transition_epochs[
+                        0] else "full_cosine"
+                    torch.save({
+                        'beta': diffusion.beta,
+                        'alpha': diffusion.alpha,
+                        'alpha_bar': diffusion.alpha_bar,
+                        'schedule_type': schedule_type
+                    }, f"{save_dir}/diffusion_schedule_{schedule_type}_epoch_{epoch + 1}.pt")
 
                 # Save checkpoint
                 torch.save(unet.state_dict(), f"{save_dir}/conditional_diffusion_epoch_{epoch + 1}.pt")
 
         return unet, diffusion, loss_history
 
-    # Calculate remaining epochs
     remaining_epochs = total_epochs - start_epoch
 
     # If no diffusion model is loaded, train a new one
     if 'diffusion' not in locals():
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            autoencoder, conditional_unet, num_epochs=remaining_epochs, lr=1e-3,
-            visualize_every=500,  # Visualize every 500 epochs
+            autoencoder, conditional_unet,
+            num_epochs=remaining_epochs,
+            lr=1e-3,
+            visualize_every=500,
             save_dir=results_dir,
-            start_epoch=start_epoch  # Pass the start epoch
+            start_epoch=start_epoch,
+            transition_epochs=[150, 300]  # Transition points in continuation schedule
         )
 
         # Save diffusion model
@@ -1694,7 +1802,7 @@ def main(checkpoint_path=None, total_epochs=10000):
         # Continue training from the loaded checkpoint
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
             autoencoder, conditional_unet, num_epochs=remaining_epochs, lr=1e-3,
-            visualize_every=500,  # Visualize every 500 epochs
+            visualize_every=100,  # Visualize every 200 epochs
             save_dir=results_dir,
             start_epoch=start_epoch  # Pass the start epoch
         )
@@ -1734,4 +1842,4 @@ def main(checkpoint_path=None, total_epochs=10000):
 
 
 if __name__ == "__main__":
-    main(checkpoint_path="./cifar_cat_dog_conditional_v7/conditional_diffusion_epoch_1000.pt", total_epochs=10000)
+    main(checkpoint_path="./cifar_cat_dog_conditional_v7/conditional_diffusion_epoch_2000.pt", total_epochs=10000)
