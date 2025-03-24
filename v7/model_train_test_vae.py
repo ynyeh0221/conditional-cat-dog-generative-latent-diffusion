@@ -361,9 +361,8 @@ class Swish(nn.Module):
 
 
 # Time embedding for diffusion model
-# Revised TimeEmbedding for flat latent space
 class TimeEmbedding(nn.Module):
-    def __init__(self, n_channels=128):
+    def __init__(self, n_channels=256):  # Increased from 128 to 256
         super().__init__()
         self.n_channels = n_channels
         self.lin1 = nn.Linear(self.n_channels, self.n_channels)
@@ -389,7 +388,7 @@ class TimeEmbedding(nn.Module):
 
 # Revised ClassEmbedding for flat latent space
 class ClassEmbedding(nn.Module):
-    def __init__(self, num_classes=2, n_channels=128):
+    def __init__(self, num_classes=2, n_channels=256):  # Increased from 128 to 256
         super().__init__()
         self.embedding = nn.Embedding(num_classes, n_channels)
         self.lin1 = nn.Linear(n_channels, n_channels)
@@ -505,12 +504,12 @@ class SwitchSequential(nn.Sequential):
 
 # Class-Conditional UNet modified for 256-dim latent space
 class ConditionalUNet(nn.Module):
-    def __init__(self, latent_dim=256, hidden_dims=[256, 512, 256], time_emb_dim=128, num_classes=2, dropout_rate=0.3):
+    def __init__(self, latent_dim=512, hidden_dims=[256, 512, 1024, 512, 256], time_emb_dim=256, num_classes=2, dropout_rate=0.3):
         super().__init__()
-        self.latent_dim = latent_dim  # Changed from 128 to 256
+        self.latent_dim = latent_dim  # Changed from 256 to 512
 
         # Use consistent embedding dimension for time and class
-        self.time_emb_dim = time_emb_dim
+        self.time_emb_dim = time_emb_dim  # Increased to 256
 
         # Time embedding with fixed dimension
         self.time_emb = TimeEmbedding(n_channels=time_emb_dim)
@@ -519,7 +518,7 @@ class ConditionalUNet(nn.Module):
         self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=time_emb_dim)
 
         # Initial projection from latent space to first hidden layer
-        self.latent_proj = nn.Linear(latent_dim, hidden_dims[0])  # Input dim changed to 256
+        self.latent_proj = nn.Linear(latent_dim, hidden_dims[0])  # Now projects from 512 to 256
 
         # Time/class embedding projections for each layer
         self.time_projections = nn.ModuleList()
@@ -545,8 +544,8 @@ class ConditionalUNet(nn.Module):
                 ])
             )
 
-        # Final layer projecting back to latent dimension - OUTPUT ALSO CHANGED TO 256
-        self.final = nn.Linear(hidden_dims[-1], latent_dim)  # Output dim changed to 256
+        # Final layer projecting back to latent dimension
+        self.final = nn.Linear(hidden_dims[-1], latent_dim)  # Now projects from 256 to 512
 
         self.residual_alpha = nn.Parameter(torch.tensor(1.0))
 
@@ -1395,7 +1394,7 @@ def main(checkpoint_path=None, total_epochs=10000):
     print(f"Using device: {device}")
 
     # Create results directory
-    results_dir = "./cifar_cat_dog_conditional_v7"
+    results_dir = "./cifar_cat_dog_conditional_v8"
     os.makedirs(results_dir, exist_ok=True)
 
     # Load CIFAR-10 dataset and filter for cats and dogs
@@ -1601,10 +1600,12 @@ def main(checkpoint_path=None, total_epochs=10000):
         plt.savefig(f"{results_dir}/autoencoder_losses.png")
         plt.close()
 
-    # Create conditional UNet
+    # Create conditional UNet with increased dimensions
     conditional_unet = ConditionalUNet(
-        hidden_dims=[128, 256, 512, 256, 128],
-        num_classes=len(class_names)  # 2 classes (cat/dog)
+        latent_dim=256,
+        hidden_dims=[256, 512, 1024, 512, 256],  # Doubled each dimension
+        time_emb_dim=256,
+        num_classes=len(class_names)  # Still 2 classes (cat/dog)
     ).to(device)
 
     # Initialize weights for UNet if needed
@@ -1646,7 +1647,7 @@ def main(checkpoint_path=None, total_epochs=10000):
 
     # Updated train_conditional_diffusion for VAE with start_epoch parameter
     def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
-                                    save_dir="./results", start_epoch=0, transition_epochs=[150, 300]):
+                                    save_dir="./results", start_epoch=0, transition_epochs=[10000, 10001]):
         """
         Train the conditional diffusion model with schedule transitions.
 
@@ -1779,10 +1780,9 @@ def main(checkpoint_path=None, total_epochs=10000):
             autoencoder, conditional_unet,
             num_epochs=remaining_epochs,
             lr=1e-3,
-            visualize_every=500,
+            visualize_every=100,
             save_dir=results_dir,
-            start_epoch=start_epoch,
-            transition_epochs=[150, 300]  # Transition points in continuation schedule
+            start_epoch=start_epoch
         )
 
         # Save diffusion model
@@ -1802,7 +1802,7 @@ def main(checkpoint_path=None, total_epochs=10000):
         # Continue training from the loaded checkpoint
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
             autoencoder, conditional_unet, num_epochs=remaining_epochs, lr=1e-3,
-            visualize_every=100,  # Visualize every 200 epochs
+            visualize_every=100,  # Visualize every 100 epochs
             save_dir=results_dir,
             start_epoch=start_epoch  # Pass the start epoch
         )
@@ -1842,4 +1842,4 @@ def main(checkpoint_path=None, total_epochs=10000):
 
 
 if __name__ == "__main__":
-    main(checkpoint_path="./cifar_cat_dog_conditional_v7/conditional_diffusion_epoch_2000.pt", total_epochs=10000)
+    main(total_epochs=10000)
