@@ -12,8 +12,6 @@ from tqdm.auto import tqdm
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import imageio
-from torch.optim.lr_scheduler import OneCycleLR
-from torch.nn.utils import spectral_norm
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
@@ -22,22 +20,14 @@ np.random.seed(42)
 # Set image size for CIFAR (32x32 RGB images)
 img_size = 32
 
-# Data preprocessing with additional augmentation
-transform_train = transforms.Compose([
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
-    transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1),
+# Data preprocessing
+transform = transforms.Compose([
     transforms.Resize((img_size, img_size)),
-    transforms.ToTensor(),
-])
-
-transform_test = transforms.Compose([
-    transforms.Resize((img_size, img_size)),
-    transforms.ToTensor(),
+    transforms.ToTensor(),  # This already scales to [0,1] range
 ])
 
 # Batch size for training
-batch_size = 128
+batch_size = 256
 
 # Define class names for CIFAR cats and dogs
 class_names = ['Cat', 'Dog']
@@ -77,10 +67,9 @@ def create_cat_dog_dataset(cifar_dataset):
     return CatDogDataset(cifar_dataset, cat_dog_indices)
 
 
-# Improved Euclidean distance loss with robust normalization
 def euclidean_distance_loss(x, y, reduction='mean'):
     """
-    Calculate the Euclidean distance between x and y tensors with improved stability.
+    Calculate the Euclidean distance between x and y tensors.
 
     Args:
         x: First tensor
@@ -90,18 +79,14 @@ def euclidean_distance_loss(x, y, reduction='mean'):
     Returns:
         Euclidean distance loss
     """
-    # Normalize inputs to prevent numerical instability
-    x_norm = F.normalize(x, p=2, dim=-1, eps=1e-12)
-    y_norm = F.normalize(y, p=2, dim=-1, eps=1e-12)
-
     # Calculate squared differences
-    squared_diff = (x_norm - y_norm) ** 2
+    squared_diff = (x - y) ** 2
 
     # Sum across all dimensions except batch
     squared_dist = squared_diff.view(x.size(0), -1).sum(dim=1)
 
     # Take square root to get Euclidean distance
-    euclidean_dist = torch.sqrt(squared_dist + 1e-12)  # Increased epsilon for stability
+    euclidean_dist = torch.sqrt(squared_dist + 1e-8)  # Add small epsilon to avoid numerical instability
 
     # Apply reduction
     if reduction == 'mean':
@@ -112,17 +97,7 @@ def euclidean_distance_loss(x, y, reduction='mean'):
         return euclidean_dist
 
 
-# Swish activation function
-class Swish(nn.Module):
-    def forward(self, x):
-        return x * torch.sigmoid(x)
-
-
-# SiLU is PyTorch's built-in version of Swish
-silu = nn.SiLU()
-
-
-# Channel Attention Layer with improved stability
+# Channel Attention Layer for improved feature selection
 class CALayer(nn.Module):
     def __init__(self, channel, reduction=16, bias=False):
         super(CALayer, self).__init__()
@@ -130,9 +105,9 @@ class CALayer(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         # Feature channel downscale and upscale --> channel weight
         self.conv_du = nn.Sequential(
-            spectral_norm(nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=bias)),
-            nn.SiLU(inplace=True),
-            spectral_norm(nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=bias)),
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=bias),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=bias),
             nn.Sigmoid()
         )
 
@@ -142,263 +117,327 @@ class CALayer(nn.Module):
         return x * y
 
 
-# Improved Convolutional Attention Block with gating
+# Convolutional Attention Block - building block for encoder/decoder
 class CAB(nn.Module):
     def __init__(self, n_feat, reduction=16, bias=False):
         super(CAB, self).__init__()
         self.body = nn.Sequential(
-            spectral_norm(nn.Conv2d(n_feat, n_feat, 3, padding=1, bias=bias)),
-            nn.GroupNorm(min(8, n_feat), n_feat),  # More stable than BatchNorm
-            nn.SiLU(inplace=True),
-            spectral_norm(nn.Conv2d(n_feat, n_feat, 3, padding=1, bias=bias)),
+            nn.Conv2d(n_feat, n_feat, 3, padding=1, bias=bias),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(n_feat, n_feat, 3, padding=1, bias=bias),
         )
         self.ca = CALayer(n_feat, reduction, bias=bias)
-        self.gate = nn.Sequential(
-            nn.Conv2d(n_feat, n_feat, 1, bias=bias),
-            nn.Sigmoid()
-        )
 
     def forward(self, x):
         res = self.body(x)
         res = self.ca(res)
-        gate = self.gate(x)
-        return x + res * gate  # Gated residual connection
+        return res + x  # Residual Connection
 
 
-# Enhanced Encoder network with spectral normalization for stability
+    def forward(self, z):
+        # z is [batch_size, latent_dim]
+        features = self.fc(z)
+        features = features.view(-1, 64, 8, 8)  # Reshape to [batch_size, 64, 8, 8]
+        return self.decoder(features)
+
+
+# Updated Center Loss for flat latent space
+class CenterLoss(nn.Module):
+    def __init__(self, num_classes=2, feat_dim=128):
+        super(CenterLoss, self).__init__()
+        self.num_classes = num_classes
+        self.feat_dim = feat_dim
+        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim))
+
+    def forward(self, x, labels):
+        batch_size = x.size(0)
+
+        # Apply L2 normalization to features and centers
+        x_norm = F.normalize(x, p=2, dim=1)  # L2 normalization
+        centers_norm = F.normalize(self.centers, p=2, dim=1)
+
+        # Calculate distance matrix using normalized vectors
+        distmat = torch.pow(x_norm, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
+                  torch.pow(centers_norm, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
+
+        # Use updated addmm_ syntax with normalized vectors
+        distmat.addmm_(x_norm, centers_norm.t(), beta=1, alpha=-2)
+
+        # Get class mask
+        classes = torch.arange(self.num_classes).to(labels.device)
+        labels = labels.unsqueeze(1).expand(batch_size, self.num_classes)
+        mask = labels.eq(classes.expand(batch_size, self.num_classes))
+
+        # Apply mask and calculate loss
+        dist = distmat * mask.float()
+        loss = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
+
+        return loss
+
+
+# Define Residual Block
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        out = self.relu(out)
+        return out
+
+
+# Enhanced Encoder with skip connections
+# Define a simplified attention module that won't conflict with existing code
+class SpatialAttention(nn.Module):
+    def __init__(self, channel, reduction=16):
+        super(SpatialAttention, self).__init__()
+        # Global average pooling
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # Feature channel downscale and upscale
+        self.conv_du = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv_du(y)
+        return x * y
+
+
+# Improved Encoder with skip connections
 class Encoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=256):
+    def __init__(self, in_channels=3, latent_dim=128):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # Improved backbone with spectral normalization and group norm
-        self.backbone = nn.Sequential(
-            spectral_norm(nn.Conv2d(in_channels, 16, 3, stride=1, padding=1)),
-            nn.GroupNorm(4, 16),
-            CAB(16, reduction=4),
-            nn.SiLU(inplace=True),
+        # Initial convolution
+        self.init_conv = nn.Conv2d(in_channels, 16, 3, stride=1, padding=1)
+        self.init_bn = nn.BatchNorm2d(16)
+        self.init_relu = nn.ReLU(inplace=True)
 
-            spectral_norm(nn.Conv2d(16, 32, 4, stride=2, padding=1)),  # 32x32 -> 16x16
-            nn.GroupNorm(8, 32),
+        # First down block
+        self.down1_conv = nn.Conv2d(16, 32, 4, stride=2, padding=1)  # 32x32 -> 16x16
+        self.down1_bn = nn.BatchNorm2d(32)
+        self.down1_relu = nn.ReLU(inplace=True)
+        self.down1_attention = SpatialAttention(32, reduction=8)
 
-            spectral_norm(nn.Conv2d(32, 64, 3, stride=1, padding=1)),
-            nn.GroupNorm(8, 64),
-            CAB(64, reduction=8),
-            nn.SiLU(inplace=True),
+        # First residual block
+        self.res1 = ResidualBlock(32)
 
-            spectral_norm(nn.Conv2d(64, 128, 4, stride=2, padding=1)),  # 16x16 -> 8x8
-            nn.GroupNorm(8, 128),
+        # Second down block
+        self.down2_conv = nn.Conv2d(32, 64, 4, stride=2, padding=1)  # 16x16 -> 8x8
+        self.down2_bn = nn.BatchNorm2d(64)
+        self.down2_relu = nn.ReLU(inplace=True)
+        self.down2_attention = SpatialAttention(64, reduction=8)
 
-            spectral_norm(nn.Conv2d(128, 64, 3, stride=1, padding=1)),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(inplace=True),
-        )
+        # Second residual block
+        self.res2 = ResidualBlock(64)
 
-        # Flattened size: 64 * 8 * 8 = 4096
+        # Final processing before latent space
+        self.final_conv = nn.Conv2d(64, 64, 3, stride=1, padding=1)
+        self.final_bn = nn.BatchNorm2d(64)
+        self.final_relu = nn.ReLU(inplace=True)
+
+        # Calculate flattened size: 64 channels * 8 * 8 = 4096
         self.flattened_size = 64 * 8 * 8
 
-        # Improved projection layers with dropout for better regularization
+        # Two separate outputs for mean and log variance
         self.fc_mu = nn.Sequential(
-            spectral_norm(nn.Linear(self.flattened_size, 512)),
-            nn.LayerNorm(512),  # LayerNorm instead of BatchNorm for stability
-            nn.SiLU(inplace=True),
-            nn.Dropout(0.1),  # Small dropout helps regularization
+            nn.Linear(self.flattened_size, 512),
+            nn.ReLU(inplace=True),
             nn.Linear(512, latent_dim)
         )
 
         self.fc_logvar = nn.Sequential(
-            spectral_norm(nn.Linear(self.flattened_size, 512)),
-            nn.LayerNorm(512),
-            nn.SiLU(inplace=True),
-            nn.Dropout(0.1),
+            nn.Linear(self.flattened_size, 512),
+            nn.ReLU(inplace=True),
             nn.Linear(512, latent_dim)
         )
 
     def forward(self, x):
-        features = self.backbone(x)
+        # Store intermediate features for skip connections
+        skip_features = []
+
+        # Initial convolution
+        x = self.init_relu(self.init_bn(self.init_conv(x)))
+        skip_features.append(x)  # 32x32x16
+
+        # First down block
+        x = self.down1_relu(self.down1_bn(self.down1_conv(x)))
+        x = self.down1_attention(x)
+        x = self.res1(x)
+        skip_features.append(x)  # 16x16x32
+
+        # Second down block
+        x = self.down2_relu(self.down2_bn(self.down2_conv(x)))
+        x = self.down2_attention(x)
+        x = self.res2(x)
+        skip_features.append(x)  # 8x8x64
+
+        # Final processing
+        features = self.final_relu(self.final_bn(self.final_conv(x)))
+
+        # Flatten for latent space projection
         flattened = features.view(features.size(0), -1)
 
-        # Return both mean and log variance
+        # Return both mean and log variance along with skip features
         mu = self.fc_mu(flattened)
         logvar = self.fc_logvar(flattened)
 
-        # Constrain the range of logvar for stability
-        logvar = torch.clamp(logvar, min=-20.0, max=2.0)
-
-        return mu, logvar
+        return mu, logvar, skip_features
 
 
-# Enhanced Decoder with more complex architecture for better reconstruction
+# Improved Decoder with skip connections
 class Decoder(nn.Module):
-    def __init__(self, latent_dim=256, out_channels=3):
+    def __init__(self, latent_dim=128, out_channels=3):
         super().__init__()
         self.latent_dim = latent_dim
 
         # Initial fully connected layer from latent space to spatial features
         self.fc = nn.Sequential(
             nn.Linear(latent_dim, 512),
-            nn.LayerNorm(512),
-            nn.SiLU(inplace=True),
-            nn.Dropout(0.1),
+            nn.ReLU(inplace=True),
             nn.Linear(512, 64 * 8 * 8)
         )
 
-        # Enhanced decoder network with skip connections and residual blocks
-        self.initial_conv = nn.Sequential(
-            spectral_norm(nn.Conv2d(64, 128, 3, stride=1, padding=1)),
-            nn.GroupNorm(8, 128),
-            nn.SiLU(inplace=True)
-        )
+        # Initial convolution after reshape
+        self.init_conv = nn.Conv2d(64, 64, 3, stride=1, padding=1)
+        self.init_bn = nn.BatchNorm2d(64)
+        self.init_relu = nn.ReLU(inplace=True)
+        self.init_attention = SpatialAttention(64, reduction=8)
 
-        # Residual block 1
-        self.res_block1 = nn.Sequential(
-            CAB(128, reduction=8),
-            nn.SiLU(inplace=True),
-            CAB(128, reduction=8),
-            nn.SiLU(inplace=True)
-        )
+        # First residual block
+        self.res1 = ResidualBlock(64)
 
         # First upsampling: 8x8 -> 16x16
-        self.upsample1 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.SiLU(inplace=True)
-        )
+        self.up1_conv = nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1)
+        self.up1_bn = nn.BatchNorm2d(32)
+        self.up1_relu = nn.ReLU(inplace=True)
+        self.up1_attention = SpatialAttention(32, reduction=8)
 
-        # Residual block 2
-        self.res_block2 = nn.Sequential(
-            CAB(64, reduction=8),
-            nn.SiLU(inplace=True),
-            CAB(64, reduction=8),
-            nn.SiLU(inplace=True)
-        )
+        # Second residual block
+        self.res2 = ResidualBlock(32)
 
         # Second upsampling: 16x16 -> 32x32
-        self.upsample2 = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.SiLU(inplace=True)
-        )
+        self.up2_conv = nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1)
+        self.up2_bn = nn.BatchNorm2d(16)
+        self.up2_relu = nn.ReLU(inplace=True)
+        self.up2_attention = SpatialAttention(16, reduction=8)
 
-        # Final refinement layers
-        self.final_block = nn.Sequential(
-            CAB(32, reduction=4),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(32, 16, 3, padding=1),
-            nn.GroupNorm(4, 16),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(16, out_channels, 3, padding=1),
-            nn.Sigmoid()  # Output activation for [0,1] range
-        )
+        # Final convolution
+        self.final_conv = nn.Conv2d(16, out_channels, 3, padding=1)
+        self.final_act = nn.Sigmoid()  # Output activation for [0,1] range
 
-    def forward(self, z):
+    def forward(self, z, skip_features=None):
         # z is [batch_size, latent_dim]
         features = self.fc(z)
         features = features.view(-1, 64, 8, 8)  # Reshape to [batch_size, 64, 8, 8]
 
-        # Apply decoder layers with residual connections
-        x = self.initial_conv(features)
-        x = x + self.res_block1(x)  # Residual connection
+        # Initial convolution
+        x = self.init_relu(self.init_bn(self.init_conv(features)))
+        x = self.init_attention(x)
 
-        x = self.upsample1(x)
-        x = x + self.res_block2(x)  # Residual connection
+        # Add skip connection if available
+        if skip_features is not None:
+            x = x + skip_features[2]  # 8x8x64
 
-        x = self.upsample2(x)
-        x = self.final_block(x)
+        x = self.res1(x)
+
+        # First upsampling
+        x = self.up1_relu(self.up1_bn(self.up1_conv(x)))
+        x = self.up1_attention(x)
+
+        # Add skip connection if available
+        if skip_features is not None:
+            x = x + skip_features[1]  # 16x16x32
+
+        x = self.res2(x)
+
+        # Second upsampling
+        x = self.up2_relu(self.up2_bn(self.up2_conv(x)))
+        x = self.up2_attention(x)
+
+        # Add skip connection if available
+        if skip_features is not None:
+            x = x + skip_features[0]  # 32x32x16
+
+        # Final convolution to image space
+        x = self.final_act(self.final_conv(x))
 
         return x
 
 
-# Improved Center Loss for better class separation in latent space
-class CenterLoss(nn.Module):
-    def __init__(self, num_classes=2, feat_dim=256, device='mps'):
-        super(CenterLoss, self).__init__()
-        self.num_classes = num_classes
-        self.feat_dim = feat_dim
-        self.device = device
+# Define Residual Block
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
 
-        # Initialize centers with Xavier/Glorot initialization
-        self.centers = nn.Parameter(
-            torch.randn(num_classes, feat_dim).to(device) * 0.02
-        )
-
-        # Register a buffer for center updates
-        self.register_buffer('classes_batch_count',
-                             torch.zeros(num_classes).to(device))
-
-    def forward(self, x, labels):
-        """
-        Args:
-            x: feature matrix with shape (batch_size, feat_dim)
-            labels: ground truth labels with shape (batch_size)
-        """
-        batch_size = x.size(0)
-
-        # Apply L2 normalization to features and centers
-        x_norm = F.normalize(x, p=2, dim=1, eps=1e-12)
-        centers_norm = F.normalize(self.centers, p=2, dim=1, eps=1e-12)
-
-        # Compute distances more efficiently and numerically stable
-        # 1 - cosine similarity as distance
-        distmat = 1.0 - torch.mm(x_norm, centers_norm.t())
-
-        # Get class mask using one-hot encoding
-        mask = torch.zeros(batch_size, self.num_classes, device=x.device)
-        mask.scatter_(1, labels.unsqueeze(1), 1)
-
-        # Apply mask and calculate loss
-        dist = distmat * mask.float()
-        loss = dist.sum() / batch_size
-
-        return loss
-
-    def update_centers(self, features, labels, alpha=0.1):
-        """
-        Update centers according to the batch features (optional)
-        Args:
-            features: feature matrix with shape (batch_size, feat_dim)
-            labels: ground truth labels with shape (batch_size)
-            alpha: learning rate for centers
-        """
-        # For each class in the batch, accumulate and update centers
-        batch_size = features.size(0)
-
-        for i in range(batch_size):
-            self.classes_batch_count[labels[i]] += 1
-            delta_c = features[i] - self.centers[labels[i]]
-            alpha_c = alpha / (1.0 + self.classes_batch_count[labels[i]])
-            self.centers[labels[i]] += alpha_c * delta_c
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        out = self.relu(out)
+        return out
 
 
-# Modified SimpleAutoencoder to implement VAE functionality
+# Enhanced SimpleAutoencoder with the updated encoder and decoder
 class SimpleAutoencoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=256, num_classes=2, kl_weight=0.001, device='mps'):
+    def __init__(self, in_channels=3, latent_dim=128, num_classes=2, kl_weight=0.001):
         super().__init__()
         self.latent_dim = latent_dim
-        self.kl_weight = kl_weight
-        self.device = device
+        self.kl_weight = kl_weight  # Weight for KL divergence term
 
-        # Updated encoder and decoder with enhanced architecture
+        # Updated encoder and decoder with VAE architecture and skip connections
         self.encoder = Encoder(in_channels, latent_dim)
         self.decoder = Decoder(latent_dim, in_channels)
 
-        # Improved classifier for latent space with more regularization
+        # Classifier for latent space
         self.classifier = nn.Sequential(
-            spectral_norm(nn.Linear(latent_dim, 256)),
-            nn.LayerNorm(256),
-            nn.SiLU(),
+            nn.Linear(latent_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.2),
             nn.Dropout(0.3),
-
-            spectral_norm(nn.Linear(256, 128)),
-            nn.LayerNorm(128),
-            nn.SiLU(),
-            nn.Dropout(0.2),
-
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.2),
             nn.Linear(128, num_classes)
         )
 
         # Center loss with updated feature dimension
-        self.center_loss = CenterLoss(num_classes=num_classes, feat_dim=latent_dim, device=device)
+        self.center_loss = CenterLoss(num_classes=num_classes, feat_dim=latent_dim)
+
+        # Apply weight initialization
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def reparameterize(self, mu, logvar):
         """
@@ -411,24 +450,24 @@ class SimpleAutoencoder(nn.Module):
     def encode(self, x):
         """
         Encode input and sample from the latent distribution.
-        Returns the sampled latent vector z.
+        Returns the sampled latent vector z and skip features.
         """
-        mu, logvar = self.encoder(x)
+        mu, logvar, skip_features = self.encoder(x)
         z = self.reparameterize(mu, logvar)
-        return z
+        return z, skip_features
 
     def encode_with_params(self, x):
         """
-        Encode input and return distribution parameters.
+        Encode input and return distribution parameters and skip features.
         This is useful for computing the KL divergence loss.
         """
         return self.encoder(x)
 
-    def decode(self, z):
+    def decode(self, z, skip_features=None):
         """
-        Decode latent vector to reconstruction.
+        Decode latent vector to reconstruction, with optional skip features.
         """
-        return self.decoder(z)
+        return self.decoder(z, skip_features)
 
     def classify(self, z):
         """
@@ -445,129 +484,78 @@ class SimpleAutoencoder(nn.Module):
     def kl_divergence(self, mu, logvar):
         """
         Compute KL divergence between N(mu, var) and N(0, 1).
-        With improved numerical stability
         """
-        # Clamp values for stability
-        logvar = torch.clamp(logvar, min=-20.0, max=20.0)
-
-        # Compute KL divergence term by term for better stability
-        var = torch.exp(logvar)
-        kl_per_element = mu.pow(2) + var - 1.0 - logvar
-
-        # Sum over dimensions, mean over batch
-        return 0.5 * torch.sum(kl_per_element, dim=1).mean()
+        return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
 
     def forward(self, x):
         """
         Complete forward pass.
         """
-        mu, logvar = self.encoder(x)
+        mu, logvar, skip_features = self.encoder(x)
         z = self.reparameterize(mu, logvar)
-        x_recon = self.decoder(z)
+        x_recon = self.decoder(z, skip_features)
         return x_recon, mu, logvar, z
 
 
-# Improved Time embedding for diffusion model
+# Swish activation function
+class Swish(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+
+# Time embedding for diffusion model
+# Revised TimeEmbedding for flat latent space
 class TimeEmbedding(nn.Module):
-    def __init__(self, n_channels=256):
+    def __init__(self, n_channels=128):
         super().__init__()
         self.n_channels = n_channels
-
-        # More complex time embedding network
-        self.lin1 = spectral_norm(nn.Linear(self.n_channels, self.n_channels * 2))
-        self.norm1 = nn.LayerNorm(self.n_channels * 2)
-        self.act = nn.SiLU()
-        self.drop1 = nn.Dropout(0.1)
-
-        self.lin2 = spectral_norm(nn.Linear(self.n_channels * 2, self.n_channels))
-        self.norm2 = nn.LayerNorm(self.n_channels)
-        self.drop2 = nn.Dropout(0.1)
+        self.lin1 = nn.Linear(self.n_channels, self.n_channels)
+        self.act = Swish()
+        self.lin2 = nn.Linear(self.n_channels, self.n_channels)
 
     def forward(self, t):
-        # Improved sinusoidal time embedding
+        # Sinusoidal time embedding similar to positional encoding
         half_dim = self.n_channels // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
         emb = t[:, None] * emb[None, :]
-        emb = torch.cat((torch.sin(emb), torch.cos(emb)), dim=1)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=1)
 
         # Make sure emb has the right dimension
         if emb.shape[1] < self.n_channels:
             padding = torch.zeros(emb.shape[0], self.n_channels - emb.shape[1], device=emb.device)
             emb = torch.cat([emb, padding], dim=1)
 
-        # Process through enhanced MLP
-        emb = self.lin1(emb)
-        emb = self.norm1(emb)
-        emb = self.act(emb)
-        emb = self.drop1(emb)
-
-        emb = self.lin2(emb)
-        emb = self.norm2(emb)
-        emb = self.act(emb)
-        emb = self.drop2(emb)
-
-        return emb
+        # Process through MLP
+        return self.lin2(self.act(self.lin1(emb)))
 
 
-# Enhanced Class Embedding
+# Revised ClassEmbedding for flat latent space
 class ClassEmbedding(nn.Module):
-    def __init__(self, num_classes=2, n_channels=256):
+    def __init__(self, num_classes=2, n_channels=128):
         super().__init__()
-        # Fixed embedding dimension for stability
-        self.emb_dim = n_channels
-
-        # Improved embedding with proper initialization
-        self.embedding = nn.Embedding(num_classes, self.emb_dim)
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
-
-        # More expressive transformation
-        self.lin1 = spectral_norm(nn.Linear(self.emb_dim, self.emb_dim * 2))
-        self.norm1 = nn.LayerNorm(self.emb_dim * 2)
-        self.act = nn.SiLU()
-        self.drop1 = nn.Dropout(0.1)
-
-        self.lin2 = spectral_norm(nn.Linear(self.emb_dim * 2, n_channels))
-        self.norm2 = nn.LayerNorm(n_channels)
-        self.drop2 = nn.Dropout(0.1)
+        self.embedding = nn.Embedding(num_classes, n_channels)
+        self.lin1 = nn.Linear(n_channels, n_channels)
+        self.act = Swish()
+        self.lin2 = nn.Linear(n_channels, n_channels)
 
     def forward(self, c):
         # Get class embeddings
         emb = self.embedding(c)
-
-        # Process through enhanced MLP
-        emb = self.lin1(emb)
-        emb = self.norm1(emb)
-        emb = self.act(emb)
-        emb = self.drop1(emb)
-
-        emb = self.lin2(emb)
-        emb = self.norm2(emb)
-        emb = self.act(emb)
-        emb = self.drop2(emb)
-
-        return emb
+        # Process through MLP
+        return self.lin2(self.act(self.lin1(emb)))
 
 
-# Improved Attention block with multi-head attention
+# Attention block for UNet
 class UNetAttentionBlock(nn.Module):
     def __init__(self, channels, num_heads=4):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
 
-        assert channels % num_heads == 0, "channels must be divisible by num_heads"
-
-        self.head_dim = channels // num_heads
-        self.scale = self.head_dim ** -0.5
-
         self.norm = nn.GroupNorm(1, channels)
-        self.qkv = spectral_norm(nn.Conv2d(channels, channels * 3, 1))
-        self.proj = spectral_norm(nn.Conv2d(channels, channels, 1))
-
-        # Add output normalization and dropout for stability
-        self.out_norm = nn.GroupNorm(1, channels)
-        self.dropout = nn.Dropout(0.1)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1)
+        self.proj = nn.Conv2d(channels, channels, 1)
 
     def forward(self, x):
         b, c, h, w = x.shape
@@ -577,8 +565,7 @@ class UNetAttentionBlock(nn.Module):
         x = self.norm(x)
 
         # QKV projection
-        qkv = self.qkv(x)
-        qkv = qkv.reshape(b, 3, self.num_heads, c // self.num_heads, h * w)
+        qkv = self.qkv(x).reshape(b, 3, self.num_heads, c // self.num_heads, h * w)
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
         # Reshape for attention computation
@@ -586,62 +573,42 @@ class UNetAttentionBlock(nn.Module):
         k = k.permute(0, 1, 2, 3)  # [b, heads, c//heads, h*w]
         v = v.permute(0, 1, 3, 2)  # [b, heads, h*w, c//heads]
 
-        # Compute attention with better numerical stability
-        attn = torch.matmul(q, k) * self.scale
+        # Compute attention
+        scale = (c // self.num_heads) ** -0.5
+        attn = torch.matmul(q, k) * scale
         attn = F.softmax(attn, dim=-1)
-        attn = F.dropout(attn, p=0.1, training=self.training)
 
         # Apply attention
         out = torch.matmul(attn, v)  # [b, heads, h*w, c//heads]
         out = out.permute(0, 3, 1, 2)  # [b, c//heads, heads, h*w]
         out = out.reshape(b, c, h, w)
 
-        # Project, normalize, add dropout, and add residual
-        out = self.proj(out)
-        out = self.out_norm(out)
-        out = self.dropout(out)
-
-        return out + residual
+        # Project and add residual
+        return self.proj(out) + residual
 
 
-# Enhanced Residual block for UNet with class conditioning
+# Residual block for UNet with class conditioning
 class UNetResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, d_time=256, num_groups=8, dropout_rate=0.2):
+    def __init__(self, in_channels, out_channels, d_time=16, num_groups=8, dropout_rate=0.2):
         super().__init__()
 
         # Feature normalization and convolution
         self.norm1 = nn.GroupNorm(min(num_groups, in_channels), in_channels)
-        self.conv1 = spectral_norm(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
         # Time and class embedding projections
-        self.time_emb = nn.Sequential(
-            spectral_norm(nn.Linear(d_time, out_channels)),
-            nn.SiLU()
-        )
+        self.time_emb = nn.Linear(d_time, out_channels)
+        self.class_emb = nn.Linear(d_time, out_channels)  # Same dimension as time embedding
+        self.act = Swish()
 
-        self.class_emb = nn.Sequential(
-            spectral_norm(nn.Linear(d_time, out_channels)),
-            nn.SiLU()
-        )
-
-        self.act = nn.SiLU()
         self.dropout = nn.Dropout(dropout_rate)
 
         # Second convolution
         self.norm2 = nn.GroupNorm(min(num_groups, out_channels), out_channels)
-        self.conv2 = spectral_norm(nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1))
-
-        # Gating mechanism for improved gradient flow
-        self.gate = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1),
-            nn.Sigmoid()
-        )
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
         # Residual connection handling
-        if in_channels != out_channels:
-            self.residual = spectral_norm(nn.Conv2d(in_channels, out_channels, 1))
-        else:
-            self.residual = nn.Identity()
+        self.residual = nn.Identity() if in_channels == out_channels else nn.Conv2d(in_channels, out_channels, 1)
 
     def forward(self, x, t, c=None):
         # First part
@@ -649,12 +616,12 @@ class UNetResidualBlock(nn.Module):
         h = self.conv1(h)
 
         # Add time embedding
-        t_emb = self.time_emb(t)
+        t_emb = self.act(self.time_emb(t))
         h = h + t_emb.view(-1, t_emb.shape[1], 1, 1)
 
         # Add class embedding if provided
         if c is not None:
-            c_emb = self.class_emb(c)
+            c_emb = self.act(self.class_emb(c))
             h = h + c_emb.view(-1, c_emb.shape[1], 1, 1)
 
         # Second part
@@ -662,15 +629,11 @@ class UNetResidualBlock(nn.Module):
         h = self.dropout(h)
         h = self.conv2(h)
 
-        # Apply gating
-        g = self.gate(h)
-        h = h * g
-
         # Residual connection
         return h + self.residual(x)
 
 
-# Modified Sequential for handling time and class embeddings
+# Switch Sequential for handling time and class embeddings
 class SwitchSequential(nn.Sequential):
     def forward(self, x, t=None, c=None):
         for layer in self:
@@ -683,13 +646,13 @@ class SwitchSequential(nn.Sequential):
         return x
 
 
-# Enhanced Class-Conditional UNet with improved architecture
+# Class-Conditional UNet for noise prediction
+# Class-Conditional UNet modified for flat latent space
+# Revised ConditionalUNet for flat latent space with proper dimension handling
 class ConditionalUNet(nn.Module):
-    def __init__(self, latent_dim=256, hidden_dims=[256, 512, 1024, 512, 256],
-                 time_emb_dim=256, num_classes=2, dropout_rate=0.3, device='mps'):
+    def __init__(self, latent_dim=128, hidden_dims=[256, 512, 256], time_emb_dim=128, num_classes=2, dropout_rate=0.3):
         super().__init__()
         self.latent_dim = latent_dim
-        self.device = device
 
         # Use consistent embedding dimension for time and class
         self.time_emb_dim = time_emb_dim
@@ -700,196 +663,121 @@ class ConditionalUNet(nn.Module):
         # Class embedding with same dimension
         self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=time_emb_dim)
 
-        # Initial normalization for better gradient flow
-        self.initial_norm = nn.LayerNorm(latent_dim)
-
         # Initial projection from latent space to first hidden layer
-        self.latent_proj = spectral_norm(nn.Linear(latent_dim, hidden_dims[0]))
+        self.latent_proj = nn.Linear(latent_dim, hidden_dims[0])
 
-        # Improved attention mechanism in hidden layers
+        # Time/class embedding projections for each layer
+        self.time_projections = nn.ModuleList()
+        for dim in hidden_dims:
+            self.time_projections.append(nn.Linear(time_emb_dim, dim))
+
+        # MLP-based layers
         self.layers = nn.ModuleList()
-        self.attentions = nn.ModuleList()
-        self.norms = nn.ModuleList()
-        self.dropouts = nn.ModuleList()
 
         # Build hidden layers
         for i in range(len(hidden_dims) - 1):
-            # Layer norm and dropout for current dimension
-            self.norms.append(nn.LayerNorm(hidden_dims[i]))
-            self.dropouts.append(nn.Dropout(dropout_rate))
+            self.layers.append(
+                nn.ModuleList([
+                    # Residual block at current dimension
+                    nn.Sequential(
+                        nn.Linear(hidden_dims[i], hidden_dims[i]),
+                        nn.LayerNorm(hidden_dims[i]),
+                        nn.Dropout(dropout_rate),
+                        nn.GELU()
+                    ),
+                    # Projection to next dimension
+                    nn.Linear(hidden_dims[i], hidden_dims[i + 1])
+                ])
+            )
 
-            # Attention for feature mixing at each level
-            self.attentions.append(nn.MultiheadAttention(
-                embed_dim=hidden_dims[i],
-                num_heads=8,
-                dropout=0.1,
-                batch_first=True
-            ))
-
-            # Time/class conditioned MLP layer
-            nn.ModuleList([
-                # First MLP layer
-                nn.Sequential(
-                    spectral_norm(nn.Linear(hidden_dims[i], hidden_dims[i] * 4)),
-                    nn.LayerNorm(hidden_dims[i] * 4),
-                    nn.SiLU(),
-                    nn.Dropout(dropout_rate),
-                    spectral_norm(nn.Linear(hidden_dims[i] * 4, hidden_dims[i]))
-                ),
-                # Projection to next dimension
-                nn.Sequential(
-                    spectral_norm(nn.Linear(hidden_dims[i], hidden_dims[i + 1])),
-                    nn.LayerNorm(hidden_dims[i + 1])
-                )
-            ])
-
-        # Final layer norm and dropout
-        self.final_norm = nn.LayerNorm(hidden_dims[-1])
-        self.final_dropout = nn.Dropout(dropout_rate)
-
-        # Final layer projecting back to latent dimension with skip connection
-        self.final = nn.Sequential(
-            spectral_norm(nn.Linear(hidden_dims[-1], hidden_dims[-1] * 2)),
-            nn.SiLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dims[-1] * 2, latent_dim)
-        )
+        # Final layer projecting back to latent dimension
+        self.final = nn.Linear(hidden_dims[-1], latent_dim)
 
     def forward(self, x, t, c=None):
-        original_x = x
-
-        # Initial normalization
-        x = self.initial_norm(x)
+        # x is the noisy latent vector: [batch_size, latent_dim]
+        # t is the diffusion timestep
+        # c is the optional class label
 
         # Time embedding
-        t_emb = self.time_emb(t)
+        t_emb_base = self.time_emb(t)
 
         # Class embedding (if provided)
-        c_emb = None
+        c_emb_base = None
         if c is not None:
-            c_emb = self.class_emb(c)
+            c_emb_base = self.class_emb(c)
 
         # Initial projection
         h = self.latent_proj(x)
 
-        # Process through layers with conditioning
-        for i in range(len(self.layers)):
-            # Normalize and apply attention
-            h_norm = self.norms[i](h)
-            h_attn, _ = self.attentions[i](h_norm, h_norm, h_norm)
-            h = h + h_attn  # Residual connection
-            h = self.dropouts[i](h)
+        # Process through layers with proper projection of embeddings
+        for i, (residual, downsample) in enumerate(self.layers):
+            # Project time embedding to current hidden dimension
+            t_emb = self.time_projections[i](t_emb_base)
 
-            # Current MLP layer
-            residual_mlp, project = self.layers[i]
-
-            # Create conditional inputs by concatenating embeddings
-            h_cond = h
-
-            # Add time conditioning (add as residual)
-            if t_emb is not None:
-                h_cond = h_cond + t_emb
+            # Add time conditioning
+            h = h + t_emb
 
             # Add class conditioning if provided
-            if c_emb is not None:
-                h_cond = h_cond + c_emb
+            if c_emb_base is not None:
+                # Project class embedding to same dimension as time embedding
+                c_emb = self.time_projections[i](c_emb_base)
+                h = h + c_emb
 
-            # Apply MLP with residual connection
-            h = h + residual_mlp(h_cond)
+            # Apply residual block
+            h = h + residual(h)
 
             # Apply projection to next dimension
-            h = project(h)
+            h = downsample(h)
 
-        # Final normalization and MLP
-        h = self.final_norm(h)
-        h = self.final_dropout(h)
+        # Final time and class embedding addition
+        t_emb_final = self.time_projections[-1](t_emb_base)
+        h = h + t_emb_final
 
-        # Apply final projection with skip connection
-        final_output = self.final(h)
+        if c_emb_base is not None:
+            c_emb_final = self.time_projections[-1](c_emb_base)
+            h = h + c_emb_final
 
-        # Residual connection to input
-        return final_output + original_x
+        # Final projection back to latent dimension
+        return self.final(h)
 
-# Improved beta schedule for diffusion process
-def cosine_beta_schedule(timesteps, s=0.008):
-    """Cosine schedule as proposed in https://arxiv.org/abs/2102.09672"""
-    steps = timesteps + 1
-    x = torch.linspace(0, timesteps, steps)
-    alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5) ** 2
-    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-    return torch.clip(betas, 0.0001, 0.9999)
 
-# Linear schedule for compatibility with older checkpoints
-def create_linear_schedule(n_steps=1000, device=None):
-    """Create the original linear beta schedule for loading checkpoints"""
-    beta = torch.linspace(0.0001, 0.02, n_steps).to(device)
-    return beta
-
-# Blend two schedules for smooth transitions
-def blend_schedules(schedule1, schedule2, ratio=0.5):
-    """Blend two beta schedules with the given ratio"""
-    return schedule1 * (1 - ratio) + schedule2 * ratio
-
-# Enhanced Class-conditional diffusion model
-class ConditionalDenoiseDiffusion:
-    def __init__(self, eps_model, n_steps=1000, device=None, use_linear=False):
+# Class-conditional diffusion model
+# Modified diffusion model for flat latent space
+class ConditionalDenoiseDiffusion():
+    def __init__(self, eps_model, n_steps=1000, device=None):
+        super().__init__()
         self.eps_model = eps_model
         self.device = device
-        self.n_steps = n_steps
 
-        # Choose schedule based on parameter
-        if use_linear:
-            # Use original linear schedule when loading from checkpoint
-            self.beta = create_linear_schedule(n_steps, device)
-        else:
-            # Use cosine schedule for new models (generally better)
-            self.beta = cosine_beta_schedule(n_steps).to(device)
-
+        # Linear beta schedule
+        self.beta = torch.linspace(0.0001, 0.02, n_steps).to(device)
         self.alpha = 1 - self.beta
         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-
-        # Precompute values for efficiency
-        self.sqrt_alpha_bar = torch.sqrt(self.alpha_bar)
-        self.sqrt_one_minus_alpha_bar = torch.sqrt(1 - self.alpha_bar)
+        self.n_steps = n_steps
 
     def q_sample(self, x0, t, eps=None):
         """Forward diffusion process: add noise to data"""
         if eps is None:
             eps = torch.randn_like(x0)
 
-        # Extract alpha_bar values for the specific timesteps
-        sqrt_alpha_bar_t = self.sqrt_alpha_bar[t].reshape(-1, 1)
-        sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alpha_bar[t].reshape(-1, 1)
+        alpha_bar_t = self.alpha_bar[t].reshape(-1, 1)
+        return torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * eps
 
-        # Apply diffusion formula more efficiently
-        return sqrt_alpha_bar_t * x0 + sqrt_one_minus_alpha_bar_t * eps
-
-    def p_sample(self, xt, t, c=None, guidance_scale=3.0):
-        """Single denoising step with classifier-free guidance"""
+    def p_sample(self, xt, t, c=None):
+        """Single denoising step with optional class conditioning"""
         # Convert time to tensor format expected by model
         if not isinstance(t, torch.Tensor):
             t = torch.tensor([t], device=xt.device)
 
-        # Classifier-free guidance implementation
-        if c is not None and guidance_scale > 1.0:
-            # Get unconditional prediction (no class information)
-            eps_uncond = self.eps_model(xt, t, None)
-            # Get conditional prediction (with class information)
-            eps_cond = self.eps_model(xt, t, c)
-            # Combine with guidance scale
-            eps_theta = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
-        else:
-            # Standard prediction (original code path)
-            eps_theta = self.eps_model(xt, t, c)
+        # Predict noise (with class conditioning if provided)
+        eps_theta = self.eps_model(xt, t, c)
 
-        # Get alpha values for the current timestep
+        # Get alpha values
         alpha_t = self.alpha[t].reshape(-1, 1)
         alpha_bar_t = self.alpha_bar[t].reshape(-1, 1)
 
-        # Calculate mean with numerical stability improvements
-        eps_coef = (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t + 1e-8)
-        mean = (xt - eps_coef * eps_theta) / torch.sqrt(alpha_t + 1e-8)
+        # Calculate mean
+        mean = (xt - (1 - alpha_t) / torch.sqrt(1 - alpha_bar_t) * eps_theta) / torch.sqrt(alpha_t)
 
         # Add noise if not the final step
         var = self.beta[t].reshape(-1, 1)
@@ -900,34 +788,19 @@ class ConditionalDenoiseDiffusion:
         else:
             return mean
 
-    def sample(self, shape, device, c=None, guidance_scale=3.0, callback=None):
-        """Generate samples with classifier-free guidance and optional progress callback"""
+    def sample(self, shape, device, c=None):
+        """Generate samples by denoising from pure noise with optional class conditioning"""
         # Start from pure noise
         x = torch.randn(shape, device=device)
 
-        # Progressively denoise with guidance
-        for t in reversed(range(self.n_steps)):
-            # Create batch of same timestep
-            timestep = torch.full((shape[0],), t, device=device, dtype=torch.long)
-
-            # Denoise one step
-            x = self.p_sample(x, timestep, c, guidance_scale=guidance_scale)
-
-            # Call the callback if provided (for visualization/monitoring)
-            if callback is not None and t % 100 == 0:
-                callback(x, t)
+        # Progressively denoise with class conditioning
+        for t in tqdm(reversed(range(self.n_steps)), desc="Sampling"):
+            x = self.p_sample(x, t, c)
 
         return x
 
-    def loss(self, x0, labels=None, timestep_weights=None):
-        """
-        Calculate noise prediction loss with optional class conditioning and timestep weighting
-
-        Args:
-            x0: Initial clean data
-            labels: Optional class labels for conditioning
-            timestep_weights: Optional weights for different timesteps
-        """
+    def loss(self, x0, labels=None):
+        """Calculate noise prediction loss with optional class conditioning"""
         batch_size = x0.shape[0]
 
         # Random timestep for each sample
@@ -940,17 +813,11 @@ class ConditionalDenoiseDiffusion:
         # Predict noise (with class conditioning if labels provided)
         eps_theta = self.eps_model(xt, t, labels)
 
-        # Compute MSE loss
-        loss = (eps - eps_theta).square().mean(dim=list(range(1, len(eps.shape))))
+        return euclidean_distance_loss(eps, eps_theta)
 
-        # Apply timestep weights if provided
-        if timestep_weights is not None:
-            loss = loss * timestep_weights[t]
-
-        return loss.mean()
 
 # Function to generate a grid of samples for all classes
-def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./results", guidance_scale=3.0):
+def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./results"):
     """Generate a grid of samples with n_per_class samples for each class using VAE decoder"""
     os.makedirs(save_dir, exist_ok=True)
     device = next(autoencoder.parameters()).device
@@ -964,15 +831,15 @@ def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./res
     fig, axes = plt.subplots(n_classes, n_per_class + 1, figsize=((n_per_class + 1) * 2, n_classes * 2))
 
     # Add a title to explain what the figure shows
-    fig.suptitle(f'CIFAR Cat and Dog Samples Generated by VAE-Diffusion Model (Guidance: {guidance_scale})',
-                 fontsize=16, y=0.98)
+    fig.suptitle(f'CIFAR Cat and Dog Samples Generated by VAE-Diffusion Model',
+                fontsize=16, y=0.98)
 
     for i in range(n_classes):
         # Create a text-only cell for the class name
         axes[i, 0].text(0.5, 0.5, class_names[i],
-                        fontsize=14, fontweight='bold',
-                        ha='center', va='center',
-                        bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.7))
+                       fontsize=14, fontweight='bold',
+                       ha='center', va='center',
+                       bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgray', alpha=0.7))
         axes[i, 0].axis('off')
 
         # Generate samples with class conditioning
@@ -981,8 +848,8 @@ def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./res
         # Use flat latent shape
         latent_shape = (n_per_class, autoencoder.latent_dim)
 
-        # Sample from the diffusion model with class conditioning and guidance
-        samples = diffusion.sample(latent_shape, device, class_tensor, guidance_scale=guidance_scale)
+        # Sample from the diffusion model with class conditioning
+        samples = diffusion.sample(latent_shape, device, class_tensor)
 
         # Decode samples using VAE decoder
         with torch.no_grad():
@@ -1004,26 +871,26 @@ def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./res
     description = (
         "This visualization shows cat and dog images generated by the conditional diffusion model using a VAE decoder.\n"
         "The model creates new, synthetic images based on learned patterns from CIFAR-10.\n"
-        "Each row corresponds to a different animal category as labeled.\n"
-        f"Classifier-free guidance scale: {guidance_scale} (higher values = stronger class conditioning)"
+        "Each row corresponds to a different animal category as labeled."
     )
     plt.figtext(0.5, 0.01, description, ha='center', fontsize=10,
-                bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.7))
+               bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.7))
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.92])  # Adjust layout to make room for titles
-    plt.savefig(f"{save_dir}/vae_samples_grid_all_classes_guidance_{guidance_scale:.1f}.png", dpi=150,
-                bbox_inches='tight')
+    plt.savefig(f"{save_dir}/vae_samples_grid_all_classes.png", dpi=150, bbox_inches='tight')
     plt.close()
 
     # Set models back to training mode
     autoencoder.train()
     diffusion.eps_model.train()
 
-    print(f"Generated sample grid for all classes with clearly labeled categories (guidance: {guidance_scale})")
-    return f"{save_dir}/vae_samples_grid_all_classes_guidance_{guidance_scale:.1f}.png"
+    print(f"Generated sample grid for all classes with clearly labeled categories")
+    return f"{save_dir}/vae_samples_grid_all_classes.png"
+
 
 # Visualize latent space denoising process for a specific class
-def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None, guidance_scale=3.0):
+# Modified visualize_denoising_steps for VAE
+def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None):
     """
     Visualize both the denoising process and the corresponding path in latent space for VAE.
 
@@ -1032,7 +899,6 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None,
         diffusion: Trained diffusion model
         class_idx: Target class index (0-1 for cat/dog)
         save_path: Path to save the visualization
-        guidance_scale: Scale for classifier-free guidance (higher = stronger conditioning)
     """
     device = next(autoencoder.parameters()).device
 
@@ -1044,7 +910,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None,
     print(f"Generating latent space projection for class {class_names[class_idx]}...")
 
     # Load CIFAR-10 test data
-    cifar_test = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
+    cifar_test = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
     # Filter to cat/dog classes
     test_dataset = create_cat_dog_dataset(cifar_test)
     test_loader = DataLoader(test_dataset, batch_size=500, shuffle=False)
@@ -1093,10 +959,9 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None,
             # Current denoised state
             current_x = x.clone()
 
-            # Denoise from current step to t=0 with class conditioning and guidance
+            # Denoise from current step to t=0 with class conditioning
             for time_step in range(t, -1, -1):
-                current_x = diffusion.p_sample(current_x, torch.tensor([time_step], device=device),
-                                               class_tensor, guidance_scale=guidance_scale)
+                current_x = diffusion.p_sample(current_x, torch.tensor([time_step], device=device), class_tensor)
 
             # Store the latent vector for the first sample for path visualization
             path_latents.append(current_x[0:1].detach().cpu().numpy())
@@ -1131,9 +996,8 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None,
     grid_cols = len(timesteps)
 
     # Set title for the denoising subplot
-    ax_denoising.set_title(
-        f"VAE-Diffusion Model Denoising Process for {class_names[class_idx]} (Guidance: {guidance_scale})",
-        fontsize=16, pad=10)
+    ax_denoising.set_title(f"VAE-Diffusion Model Denoising Process for {class_names[class_idx]}",
+                           fontsize=16, pad=10)
 
     # Hide axis ticks
     ax_denoising.set_xticks([])
@@ -1222,8 +1086,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None,
         )
 
     # Add markers for start and end points
-    ax_latent.scatter(path_2d[0, 0], path_2d[0, 1], c='black', s=100, marker='x', label="Start (Noise)",
-                      zorder=11)
+    ax_latent.scatter(path_2d[0, 0], path_2d[0, 1], c='black', s=100, marker='x', label="Start (Noise)", zorder=11)
     ax_latent.scatter(path_2d[-1, 0], path_2d[-1, 1], c='green', s=100, marker='*', label="End (Generated)",
                       zorder=11)
 
@@ -1242,9 +1105,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None,
         bbox=dict(boxstyle="round,pad=0.5", facecolor='white', alpha=0.8)
     )
 
-    ax_latent.set_title(
-        f"VAE-Diffusion Path in Latent Space for {class_names[class_idx]} (Guidance: {guidance_scale})",
-        fontsize=16)
+    ax_latent.set_title(f"VAE-Diffusion Path in Latent Space for {class_names[class_idx]}", fontsize=16)
     ax_latent.legend(fontsize=10, loc='best')
     ax_latent.grid(True, linestyle='--', alpha=0.7)
 
@@ -1269,6 +1130,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None,
 
     return save_path
 
+
 # Updated visualize_reconstructions for VAE
 def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
     """Visualize original and reconstructed images at each epoch for VAE"""
@@ -1276,7 +1138,7 @@ def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
     device = next(autoencoder.parameters()).device
 
     # Get a batch of test data
-    cifar_test = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
+    cifar_test = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
     test_dataset = create_cat_dog_dataset(cifar_test)
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=True)
 
@@ -1287,21 +1149,24 @@ def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
     autoencoder.eval()
     with torch.no_grad():
         # Get reconstruction with VAE forward pass
-        reconstructed, mu, logvar, _ = autoencoder(test_images)
+        # Forward pass using the updated autoencoder architecture
+        mu, logvar, skip_features = autoencoder.encode_with_params(test_images)
+        z = autoencoder.reparameterize(mu, logvar)
+        reconstructed = autoencoder.decode(z, skip_features)
 
     # Create visualization
     fig, axes = plt.subplots(2, 8, figsize=(16, 4))
 
     for i in range(8):
         # Original
-        img = test_images[i].cpu().permute(1, 2, 0).numpy()
-        axes[0, i].imshow(img)
+        img = test_images[i].cpu().permute(1, 2, 0).numpy()  # Convert from [C,H,W] to [H,W,C]
+        axes[0, i].imshow(img)  # No cmap for RGB images
         axes[0, i].set_title(f'Original: {class_names[test_labels[i]]}')
         axes[0, i].axis('off')
 
         # Reconstruction
-        recon_img = reconstructed[i].cpu().permute(1, 2, 0).numpy()
-        axes[1, i].imshow(recon_img)
+        recon_img = reconstructed[i].cpu().permute(1, 2, 0).numpy()  # Convert from [C,H,W] to [H,W,C]
+        axes[1, i].imshow(recon_img)  # No cmap for RGB images
         axes[1, i].set_title('Reconstruction')
         axes[1, i].axis('off')
 
@@ -1310,6 +1175,7 @@ def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
     plt.close()
     autoencoder.train()
 
+
 # Visualize latent space with t-SNE
 def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
     """Visualize the latent space of the VAE using t-SNE"""
@@ -1317,7 +1183,7 @@ def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
     device = next(autoencoder.parameters()).device
 
     # Get test data
-    cifar_test = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
+    cifar_test = datasets.CIFAR10(root="./data", train=False, download=True, transform=transform)
     test_dataset = create_cat_dog_dataset(cifar_test)
     test_loader = DataLoader(test_dataset, batch_size=500, shuffle=False)
 
@@ -1360,11 +1226,12 @@ def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
 
     autoencoder.train()
 
-# Function to generate samples of a specific class
-def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, save_path=None,
-                           guidance_scale=3.0):
+
+# Function to generate samples of a specific class (need this for training)
+# Updated generate_class_samples for VAE
+def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, save_path=None):
     """
-    Generate samples of a specific target class using the VAE decoder with guidance
+    Generate samples of a specific target class using the VAE decoder
 
     Args:
         autoencoder: Trained VAE model
@@ -1372,7 +1239,6 @@ def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, 
         target_class: Index of the target class (0-1) or class name
         num_samples: Number of samples to generate
         save_path: Path to save the generated samples
-        guidance_scale: Scale for classifier-free guidance (higher = stronger conditioning)
 
     Returns:
         Tensor of generated samples
@@ -1396,8 +1262,8 @@ def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, 
     # Generate samples
     latent_shape = (num_samples, autoencoder.latent_dim)
     with torch.no_grad():
-        # Sample from the diffusion model with class conditioning and guidance
-        latent_samples = diffusion.sample(latent_shape, device, class_tensor, guidance_scale=guidance_scale)
+        # Sample from the diffusion model with class conditioning
+        latent_samples = diffusion.sample(latent_shape, device, class_tensor)
 
         # Decode latents to images using VAE decoder
         samples = autoencoder.decode(latent_samples)
@@ -1412,16 +1278,17 @@ def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, 
             plt.axis('off')
             plt.title(f"{class_names[target_class]}")
 
-        plt.suptitle(f"Generated {class_names[target_class]} Samples (Guidance: {guidance_scale})")
+        plt.suptitle(f"Generated {class_names[target_class]} Samples")
         plt.tight_layout()
         plt.savefig(save_path)
         plt.close()
 
     return samples
 
-# Create diffusion animation for visualization
+
+# Modified create_diffusion_animation for flat latent space
 def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50, seed=42,
-                               save_path=None, temp_dir=None, fps=10, reverse=False, guidance_scale=3.0):
+                               save_path=None, temp_dir=None, fps=10, reverse=False):
     """
     Create a GIF animation showing the diffusion process.
 
@@ -1435,7 +1302,6 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
         temp_dir: Directory to save temporary frames (will be created if None)
         fps: Frames per second in the output GIF
         reverse: If False (default), show t=0→1000 (image to noise), otherwise t=1000→0 (noise to image)
-        guidance_scale: Scale for classifier-free guidance (higher = stronger conditioning)
 
     Returns:
         Path to the created GIF file
@@ -1496,8 +1362,7 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
         backward_timesteps = sorted(timesteps[1:-1], reverse=True)
         timesteps = timesteps + backward_timesteps
 
-    print(
-        f"Creating diffusion animation for class '{class_names[class_idx]}' with guidance scale {guidance_scale}...")
+    print(f"Creating diffusion animation for class '{class_names[class_idx]}'...")
     frame_paths = []
 
     with torch.no_grad():
@@ -1506,10 +1371,9 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
         # Start from pure noise - now using flat latent dimension
         x = torch.randn((1, autoencoder.latent_dim), device=device)
 
-        # Denoise completely to get clean image at t=0 with guidance
+        # Denoise completely to get clean image at t=0
         for time_step in tqdm(range(total_steps - 1, -1, -1), desc="Denoising"):
-            x = diffusion.p_sample(x, torch.tensor([time_step], device=device),
-                                   class_tensor, guidance_scale=guidance_scale)
+            x = diffusion.p_sample(x, torch.tensor([time_step], device=device), class_tensor)
 
         # Now we have a clean, denoised image at t=0
         clean_x = x.clone()
@@ -1543,7 +1407,7 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
 
             # Add timestep information
             progress = (t / total_steps) * 100
-            title = f'Class: {class_names[class_idx]} (t={t}, {progress:.1f}% noise, guidance={guidance_scale})'
+            title = f'Class: {class_names[class_idx]} (t={t}, {progress:.1f}% noise)'
             ax.set_title(title)
 
             # Save frame
@@ -1573,8 +1437,23 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
     print(f"Animation saved to {save_path}")
     return save_path
 
+
 # Updated function to compute VAE loss (reconstruction + KL divergence)
-def vae_loss(x_recon, x, mu, logvar, kl_weight=0.001, max_kl=50.0, reduction='mean'):
+def vae_loss(x_recon, x, mu, logvar, kl_weight=0.001, reduction='mean'):
+    """
+    Compute VAE loss with reconstruction and KL divergence terms.
+
+    Args:
+        x_recon: Reconstructed tensor
+        x: Original tensor
+        mu: Mean of latent distribution
+        logvar: Log variance of latent distribution
+        kl_weight: Weight for KL divergence term
+        reduction: 'mean', 'sum', or 'none'
+
+    Returns:
+        Total loss, reconstruction loss, and KL divergence
+    """
     # Reconstruction loss (using Euclidean distance)
     squared_diff = (x_recon - x) ** 2
     squared_dist = squared_diff.view(x.size(0), -1).sum(dim=1)
@@ -1582,8 +1461,6 @@ def vae_loss(x_recon, x, mu, logvar, kl_weight=0.001, max_kl=50.0, reduction='me
 
     # KL divergence
     kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-
-    kl_div = torch.clamp(kl_div, max=max_kl)
 
     # Total loss
     if reduction == 'mean':
@@ -1600,267 +1477,187 @@ def vae_loss(x_recon, x, mu, logvar, kl_weight=0.001, max_kl=50.0, reduction='me
     return total_loss, recon_loss, kl_div
 
 # Main function
-# Main function
-def main(checkpoint_path=None, total_epochs=10000):
+def main():
     """Main function to run the entire pipeline non-interactively"""
     print("Starting class-conditional diffusion model for CIFAR cats and dogs")
 
     # Set device
     device = torch.device("mps" if torch.backends.mps.is_available() else
-                          ("cuda" if torch.cuda.is_available() else "cpu"))
+                         ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
 
     # Create results directory
-    results_dir = "./cifar_cat_dog_conditional_v9"
+    results_dir = "./cifar_cat_dog_conditional_v6_2"
     os.makedirs(results_dir, exist_ok=True)
 
     # Load CIFAR-10 dataset and filter for cats and dogs
     print("Loading and filtering CIFAR-10 dataset for cats and dogs...")
-    cifar_train = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
+    cifar_train = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
     train_dataset = create_cat_dog_dataset(cifar_train)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2,
-                              pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
     # Paths for saved models
     autoencoder_path = f"{results_dir}/cifar_cat_dog_autoencoder.pt"
     diffusion_path = f"{results_dir}/conditional_diffusion_final.pt"
 
     # Create autoencoder
-    autoencoder = SimpleAutoencoder(in_channels=3, latent_dim=256).to(
-        device)  # 3 channels for RGB
-
-    # Define the training function OUTSIDE the conditional block
-    def train_autoencoder(autoencoder, train_loader, num_epochs=100, lr=1e-4, lambda_cls=5.0,
-                          lambda_center=2.0, kl_weight=0.03, visualize_every=100, save_dir="./results"):
-        """Train VAE with separate optimization paths"""
-        print("Starting VAE training with class separation...")
-        os.makedirs(save_dir, exist_ok=True)
-        device = next(autoencoder.parameters()).device
-
-        # Create optimizers - don't share parameters between optimizers
-        recon_optimizer = optim.AdamW(
-            list(autoencoder.encoder.parameters()) +
-            list(autoencoder.decoder.parameters()),
-            lr=lr,
-            weight_decay=1e-5  # Add weight decay for regularization
-        )
-
-        class_optimizer = optim.AdamW(
-            list(autoencoder.classifier.parameters()) +
-            list(autoencoder.center_loss.parameters()),
-            lr=lr * 5,  # Keep the higher learning rate for classifier
-            weight_decay=1e-5  # Same weight decay
-        )
-
-        # Create learning rate schedulers with warmup
-        total_steps = len(train_loader) * num_epochs
-
-        # OneCycleLR provides both warmup and annealing
-        recon_scheduler = OneCycleLR(
-            recon_optimizer,
-            max_lr=lr,
-            total_steps=total_steps,
-            pct_start=0.05,  # 5% of training for warmup
-            anneal_strategy='cos',  # Cosine annealing after warmup
-            div_factor=25.0,  # Initial lr = max_lr/25
-            final_div_factor=10000.0  # Final lr = initial_lr/10000
-        )
-
-        class_scheduler = OneCycleLR(
-            class_optimizer,
-            max_lr=lr * 5,  # Keep the 5x multiplier for classifier
-            total_steps=total_steps,
-            pct_start=0.05,
-            anneal_strategy='cos',
-            div_factor=25.0,
-            final_div_factor=10000.0
-        )
-
-        loss_history = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': []}
-
-        cycle_length = num_epochs // 4
-        R = 0.7
-
-        for epoch in range(num_epochs):
-            autoencoder.train()
-            epoch_recon_loss = 0
-            epoch_kl_loss = 0
-            epoch_class_loss = 0
-            epoch_center_loss = 0
-            epoch_total_loss = 0
-
-            if epoch % cycle_length == 0 and epoch > 0:
-                print(f"Epoch {epoch + 1}: Starting new annealing cycle, resetting optimizer momentum...")
-                for param_group in recon_optimizer.param_groups:
-                    for p in param_group['params']:
-                        if p in recon_optimizer.state:
-                            param_state = recon_optimizer.state[p]
-                            if 'momentum_buffer' in param_state:
-                                param_state['momentum_buffer'].zero_()
-                            if 'exp_avg' in param_state:  # Adam优化器
-                                param_state['exp_avg'].zero_()
-                                param_state['exp_avg_sq'].zero_()
-
-                for param_group in class_optimizer.param_groups:
-                    for p in param_group['params']:
-                        if p in class_optimizer.state:
-                            param_state = class_optimizer.state[p]
-                            if 'momentum_buffer' in param_state:
-                                param_state['momentum_buffer'].zero_()
-                            if 'exp_avg' in param_state:  # Adam优化器
-                                param_state['exp_avg'].zero_()
-                                param_state['exp_avg_sq'].zero_()
-
-            cycle_position = (epoch % cycle_length) / cycle_length
-
-            if cycle_position < R:
-                current_kl_weight = kl_weight * (cycle_position / R)
-            else:
-                current_kl_weight = kl_weight
-
-            print(f"Epoch {epoch + 1}: Using KL weight = {current_kl_weight:.6f}")
-
-            for batch_idx, (data, labels) in enumerate(
-                    tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
-                data = data.to(device)
-                labels = labels.to(device)
-
-                # Step 1: Reconstruction optimization (VAE path)
-                recon_optimizer.zero_grad()
-
-                # Get mu and logvar from encoder
-                mu, logvar = autoencoder.encode_with_params(data)
-
-                # Sample latent vector using reparameterization trick
-                z = autoencoder.reparameterize(mu, logvar)
-
-                # Decode to get reconstruction
-                reconstructed = autoencoder.decode(z)
-
-                # Compute VAE loss (reconstruction + KL divergence)
-                total_loss, recon_loss, kl_loss = vae_loss(
-                    reconstructed, data, mu, logvar, kl_weight=current_kl_weight
-                )
-
-                # Backward pass for reconstruction path
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    list(autoencoder.encoder.parameters()) + list(autoencoder.decoder.parameters()),
-                    max_norm=0.1
-                )
-                recon_optimizer.step()
-                recon_scheduler.step()  # Step the scheduler after each batch
-
-                # Step 2: Classification optimization
-                class_optimizer.zero_grad()
-
-                # Detach encoder output to prevent gradients flowing back into encoder
-                with torch.no_grad():
-                    mu, logvar = autoencoder.encode_with_params(data)
-                    z = autoencoder.reparameterize(mu, logvar)
-
-                # Forward through classification branch only
-                class_logits = autoencoder.classify(z)
-                class_loss = F.cross_entropy(class_logits, labels)
-                center_loss = autoencoder.compute_center_loss(z, labels)
-
-                # Combined classification loss
-                total_class_loss = lambda_cls * class_loss + lambda_center * center_loss
-                total_class_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    list(autoencoder.classifier.parameters()) + list(autoencoder.center_loss.parameters()),
-                    max_norm=0.5
-                )
-
-                class_optimizer.step()
-                class_scheduler.step()  # Step the scheduler after each batch
-
-                # Record losses
-                epoch_recon_loss += recon_loss.item()
-                epoch_kl_loss += kl_loss.item()
-                epoch_class_loss += class_loss.item()
-                epoch_center_loss += center_loss.item()
-                epoch_total_loss += total_loss.item()
-
-            # Calculate average losses
-            num_batches = len(train_loader)
-            avg_recon_loss = epoch_recon_loss / num_batches
-            avg_kl_loss = epoch_kl_loss / num_batches
-            avg_class_loss = epoch_class_loss / num_batches
-            avg_center_loss = epoch_center_loss / num_batches
-            avg_total_loss = epoch_total_loss / num_batches
-
-            # Store losses for plotting
-            loss_history['recon'].append(avg_recon_loss)
-            loss_history['kl'].append(avg_kl_loss)
-            loss_history['class'].append(avg_class_loss)
-            loss_history['center'].append(avg_center_loss)
-            loss_history['total'].append(avg_total_loss)
-
-            # Print losses
-            print(f"Epoch {epoch + 1}/{num_epochs}, "
-                  f"Total Loss: {avg_total_loss:.6f}, "
-                  f"Recon Loss: {avg_recon_loss:.6f}, "
-                  f"KL Loss: {avg_kl_loss:.6f}, "
-                  f"Class Loss: {avg_class_loss:.6f}, "
-                  f"Center Loss: {avg_center_loss:.6f}")
-
-            # Visualizations
-            if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
-                visualize_reconstructions(autoencoder, epoch + 1, save_dir)
-                visualize_latent_space(autoencoder, epoch + 1, save_dir)
-
-                # Save checkpoint
-                torch.save(autoencoder.state_dict(), f"{save_dir}/vae_epoch_{epoch + 1}.pt")
-
-        return autoencoder, loss_history
+    autoencoder = SimpleAutoencoder(in_channels=3).to(device)  # 3 channels for RGB
 
     # Check if trained autoencoder exists
     if os.path.exists(autoencoder_path):
         print(f"Loading existing autoencoder from {autoencoder_path}")
         autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device))
         autoencoder.eval()
-        # Create dummy loss history for consistency
-        ae_losses = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': []}
     else:
         print("No existing autoencoder found. Training a new one...")
+
+        # Updated training function for the VAE
+        def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4, lambda_cls=5.0, lambda_center=2.0,
+                              kl_weight=0.001, visualize_every=1, save_dir="./results"):
+            """Train VAE with separate optimization paths"""
+            print("Starting VAE training with class separation...")
+            os.makedirs(save_dir, exist_ok=True)
+            device = next(autoencoder.parameters()).device
+
+            # Create optimizers - don't share parameters between optimizers
+            recon_optimizer = optim.Adam(list(autoencoder.encoder.parameters()) +
+                                         list(autoencoder.decoder.parameters()), lr=lr)
+
+            class_optimizer = optim.Adam(list(autoencoder.classifier.parameters()) +
+                                         list(autoencoder.center_loss.parameters()), lr=lr * 5)
+
+            loss_history = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': []}
+
+            for epoch in range(num_epochs):
+                autoencoder.train()
+                epoch_recon_loss = 0
+                epoch_kl_loss = 0
+                epoch_class_loss = 0
+                epoch_center_loss = 0
+                epoch_total_loss = 0
+
+                for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
+                    data = data.to(device)
+                    labels = labels.to(device)
+
+                    # Step 1: Reconstruction optimization (VAE path)
+                    recon_optimizer.zero_grad()
+
+                    # Get mu, logvar, and skip features from encoder
+                    mu, logvar, skip_features = autoencoder.encode_with_params(data)
+
+                    # Sample latent vector using reparameterization trick
+                    z = autoencoder.reparameterize(mu, logvar)
+
+                    # Decode to get reconstruction, using skip features
+                    reconstructed = autoencoder.decode(z, skip_features)
+
+                    # Compute VAE loss (reconstruction + KL divergence)
+                    recon_loss = euclidean_distance_loss(reconstructed, data)
+                    kl_loss = autoencoder.kl_divergence(mu, logvar)
+                    total_loss = recon_loss + kl_weight * kl_loss
+
+                    # Backward pass for reconstruction path
+                    total_loss.backward()
+                    recon_optimizer.step()
+
+                    # Step 2: Classification optimization
+                    class_optimizer.zero_grad()
+
+                    # Detach encoder output to prevent gradients flowing back into encoder
+                    with torch.no_grad():
+                        mu, logvar, _ = autoencoder.encode_with_params(data)
+                        z = autoencoder.reparameterize(mu, logvar)
+
+                    # Forward through classification branch only
+                    class_logits = autoencoder.classify(z)
+                    class_loss = F.cross_entropy(class_logits, labels)
+                    center_loss = autoencoder.compute_center_loss(z, labels)
+
+                    # Combined classification loss
+                    total_class_loss = lambda_cls * class_loss + lambda_center * center_loss
+                    total_class_loss.backward()
+
+                    # Add gradient clipping here, before optimizer step
+                    torch.nn.utils.clip_grad_norm_(autoencoder.classifier.parameters(), max_norm=1.0)
+
+                    class_optimizer.step()
+
+                    # Record losses
+                    epoch_recon_loss += recon_loss.item()
+                    epoch_kl_loss += kl_loss.item()
+                    epoch_class_loss += class_loss.item()
+                    epoch_center_loss += center_loss.item()
+                    epoch_total_loss += total_loss.item()
+
+                # Calculate average losses
+                num_batches = len(train_loader)
+                avg_recon_loss = epoch_recon_loss / num_batches
+                avg_kl_loss = epoch_kl_loss / num_batches
+                avg_class_loss = epoch_class_loss / num_batches
+                avg_center_loss = epoch_center_loss / num_batches
+                avg_total_loss = epoch_total_loss / num_batches
+
+                # Store losses for plotting
+                loss_history['recon'].append(avg_recon_loss)
+                loss_history['kl'].append(avg_kl_loss)
+                loss_history['class'].append(avg_class_loss)
+                loss_history['center'].append(avg_center_loss)
+                loss_history['total'].append(avg_total_loss)
+
+                # Print losses
+                print(f"Epoch {epoch + 1}/{num_epochs}, "
+                      f"Total Loss: {avg_total_loss:.6f}, "
+                      f"Recon Loss: {avg_recon_loss:.6f}, "
+                      f"KL Loss: {avg_kl_loss:.6f}, "
+                      f"Class Loss: {avg_class_loss:.6f}, "
+                      f"Center Loss: {avg_center_loss:.6f}")
+
+                # Visualizations
+                if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
+                    visualize_reconstructions(autoencoder, epoch + 1, save_dir)
+                    visualize_latent_space(autoencoder, epoch + 1, save_dir)
+
+                    # Save checkpoint
+                    torch.save(autoencoder.state_dict(), f"{save_dir}/vae_epoch_{epoch + 1}.pt")
+
+            return autoencoder, loss_history
+
         # Train autoencoder
         autoencoder, ae_losses = train_autoencoder(
             autoencoder,
-            train_loader,
-            num_epochs=1000,
+            train_loader,  # Add this parameter
+            num_epochs=600,
             lr=1e-4,
             lambda_cls=5.0,
-            lambda_center=2.3,
-            kl_weight=0.035,
-            visualize_every=100,
+            lambda_center=2.0,
+            visualize_every=5,
             save_dir=results_dir
         )
+
         # Save autoencoder
         torch.save(autoencoder.state_dict(), autoencoder_path)
 
-    # Plot autoencoder loss
-    plt.figure(figsize=(8, 5))
-    # Plot each loss type separately
-    plt.figure(figsize=(10, 6))
-    plt.plot(ae_losses['total'], label='Total Loss')
-    plt.plot(ae_losses['recon'], label='Reconstruction Loss')
-    plt.plot(ae_losses['class'], label='Classification Loss')
-    plt.plot(ae_losses['center'], label='Center Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Autoencoder Training Losses')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(f"{results_dir}/autoencoder_losses.png")
-    plt.close()
+        # Plot autoencoder loss
+        plt.figure(figsize=(8, 5))
+        # Plot each loss type separately
+        plt.figure(figsize=(10, 6))
+        plt.plot(ae_losses['total'], label='Total Loss')
+        plt.plot(ae_losses['recon'], label='Reconstruction Loss')
+        plt.plot(ae_losses['class'], label='Classification Loss')
+        plt.plot(ae_losses['center'], label='Center Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Autoencoder Training Losses')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"{results_dir}/autoencoder_losses.png")
+        plt.close()
 
-    # Create conditional UNet with increased dimensions
+    # Create conditional UNet
     conditional_unet = ConditionalUNet(
-        latent_dim=256,
-        hidden_dims=[256, 512, 1024, 512, 256],  # Doubled each dimension
-        time_emb_dim=256,
-        num_classes=len(class_names)
+        hidden_dims=[128, 256, 512, 256, 128],
+        num_classes=len(class_names)  # 2 classes (cat/dog)
     ).to(device)
 
     # Initialize weights for UNet if needed
@@ -1870,189 +1667,87 @@ def main(checkpoint_path=None, total_epochs=10000):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
-    # Extract epoch number from checkpoint path if provided
-    start_epoch = 0
-    # First check the provided checkpoint path, if any
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        # Parse epoch number from filename (assumes format "conditional_diffusion_epoch_X.pt")
-        try:
-            filename = os.path.basename(checkpoint_path)
-            # Extract number between "epoch_" and ".pt"
-            epoch_str = filename.split("epoch_")[1].split(".pt")[0]
-            start_epoch = int(epoch_str)
-            print(f"Continuing training from epoch {start_epoch}")
-
-            # Load the model
-            conditional_unet.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
-            diffusion = ConditionalDenoiseDiffusion(conditional_unet, n_steps=1000, device=device)
-        except (IndexError, ValueError) as e:
-            print(f"Could not extract epoch number from checkpoint filename: {e}")
-            print("Starting from epoch 0")
-            start_epoch = 0
-    # Then check if standard diffusion path exists
-    elif os.path.exists(diffusion_path):
+    # Check if trained diffusion model exists
+    if os.path.exists(diffusion_path):
         print(f"Loading existing diffusion model from {diffusion_path}")
         conditional_unet.load_state_dict(torch.load(diffusion_path, map_location=device))
         diffusion = ConditionalDenoiseDiffusion(conditional_unet, n_steps=1000, device=device)
-    # If no checkpoint found, we'll start from scratch
     else:
         print("No existing diffusion model found. Training a new one...")
         conditional_unet.apply(init_weights)
-        # diffusion variable will be initialized during training
 
-    # Define train_conditional_diffusion function
-    def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
-                                   save_dir="./results", start_epoch=0, transition_epochs=[10000, 10001]):
-        """
-        Train the conditional diffusion model with schedule transitions.
+        # Updated train_conditional_diffusion for VAE
+        def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
+                                        save_dir="./results"):
+            print("Starting Class-Conditional Diffusion Model training with VAE...")
+            os.makedirs(save_dir, exist_ok=True)
 
-        Args:
-            autoencoder: Trained VAE model
-            unet: UNet denoising model
-            num_epochs: Number of epochs to train
-            lr: Learning rate
-            visualize_every: Epochs between visualizations
-            save_dir: Directory to save results
-            start_epoch: Starting epoch number (if continuing from checkpoint)
-            transition_epochs: When to transition to cosine schedule [blend_point, full_cosine_point]
-        """
-        print(f"Starting Class-Conditional Diffusion Model training with VAE from epoch {start_epoch + 1}...")
-        os.makedirs(save_dir, exist_ok=True)
+            autoencoder.eval()  # Set VAE to evaluation mode
 
-        autoencoder.eval()  # Set VAE to evaluation mode
+            # Create diffusion model
+            diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device)
+            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-2)
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, max_lr=1e-3, total_steps=num_epochs * len(train_loader),
+                pct_start=0.1  # Warm-up for 10% of training
+            )
 
-        # Create diffusion model with initial linear schedule for continuing from checkpoint
-        diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device, use_linear=True)
+            # Training loop
+            loss_history = []
 
-        # Create optimizer and warm restart scheduler
-        optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=5e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer,
-            T_0=20,  # Restart every 20 epochs
-            T_mult=2,  # Double period after each restart
-            eta_min=1e-6
-        )
+            for epoch in range(num_epochs):
+                epoch_loss = 0
 
-        # Step scheduler to match start_epoch
-        if start_epoch > 0:
-            for _ in range(start_epoch):
+                for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
+                    data = data.to(device)
+                    labels = labels.to(device)
+
+                    # Encode images to latent space using VAE
+                    with torch.no_grad():
+                        # Use the sample from encoding function
+                        latents = autoencoder.encode(data)
+
+                    # Calculate diffusion loss with class conditioning
+                    loss = diffusion.loss(latents, labels)
+
+                    # Backward pass
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                    epoch_loss += loss.item()
+
+                # Calculate average loss
+                avg_loss = epoch_loss / len(train_loader)
+                loss_history.append(avg_loss)
+                print(f"Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.6f}")
+
+                # Learning rate scheduling
                 scheduler.step()
 
-        # Create cosine schedule for later transition
-        cosine_beta = cosine_beta_schedule(diffusion.n_steps).to(device)
+                # Visualize samples periodically
+                if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
+                    # Generate samples for both classes
+                    for class_idx in range(len(class_names)):
+                        create_diffusion_animation(autoencoder, diffusion, class_idx=class_idx, num_frames=50,
+                                                   save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif")
+                        save_path = f"{save_dir}/sample_class_{class_names[class_idx]}_epoch_{epoch + 1}.png"
+                        generate_class_samples(autoencoder, diffusion, target_class=class_idx, num_samples=5,
+                                               save_path=save_path)
+                        save_path = f"{save_dir}/denoising_path_{class_names[class_idx]}_epoch_{epoch + 1}.png"
+                        visualize_denoising_steps(autoencoder, diffusion, class_idx=class_idx, save_path=save_path)
 
-        # Create timestep weights to focus more on important timesteps
-        timestep_weights = torch.ones(diffusion.n_steps, device=device)
-        mid_point = diffusion.n_steps // 2
-        # Add more weight to middle timesteps (bell curve)
-        for t in range(diffusion.n_steps):
-            # Create a bell curve centered at mid_point
-            timestep_weights[t] = 1.0 + 0.5 * torch.exp(torch.tensor(-0.5 * ((t - mid_point) / (diffusion.n_steps / 6)) ** 2, device=device))
+                    # Save checkpoint
+                    torch.save(unet.state_dict(), f"{save_dir}/conditional_diffusion_epoch_{epoch + 1}.pt")
 
-        # Training loop
-        loss_history = []
+            return unet, diffusion, loss_history
 
-        for epoch in range(start_epoch, start_epoch + num_epochs):
-            epoch_loss = 0
-
-            # Schedule transition logic
-            current_epoch_in_continuation = epoch - start_epoch
-
-            # First transition - blend linear and cosine schedules
-            if transition_epochs[0] is not None and current_epoch_in_continuation == transition_epochs[0]:
-                print(f"Epoch {epoch + 1}: Transitioning to blended beta schedule (50% cosine)...")
-                linear_beta = diffusion.beta.clone()
-                diffusion.beta = blend_schedules(linear_beta, cosine_beta, ratio=0.5)
-                diffusion.alpha = 1 - diffusion.beta
-                diffusion.alpha_bar = torch.cumprod(diffusion.alpha, dim=0)
-                # Update precomputed values
-                diffusion.sqrt_alpha_bar = torch.sqrt(diffusion.alpha_bar)
-                diffusion.sqrt_one_minus_alpha_bar = torch.sqrt(1 - diffusion.alpha_bar)
-
-            # Second transition - full cosine schedule
-            elif transition_epochs[1] is not None and current_epoch_in_continuation == transition_epochs[1]:
-                print(f"Epoch {epoch + 1}: Completing transition to full cosine beta schedule...")
-                diffusion.beta = cosine_beta.clone()
-                diffusion.alpha = 1 - diffusion.beta
-                diffusion.alpha_bar = torch.cumprod(diffusion.alpha, dim=0)
-                # Update precomputed values
-                diffusion.sqrt_alpha_bar = torch.sqrt(diffusion.alpha_bar)
-                diffusion.sqrt_one_minus_alpha_bar = torch.sqrt(1 - diffusion.alpha_bar)
-
-            # Normal training loop
-            for batch_idx, (data, labels) in enumerate(
-                    tqdm(train_loader, desc=f"Epoch {epoch + 1}/{start_epoch + num_epochs}")):
-                data = data.to(device)
-                labels = labels.to(device)
-
-                # Encode images to latent space using VAE
-                with torch.no_grad():
-                    latents = autoencoder.encode(data)
-
-                # Calculate diffusion loss with class conditioning and timestep weighting
-                loss = diffusion.loss(latents, labels, timestep_weights)
-
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
-                optimizer.step()
-
-                epoch_loss += loss.item()
-
-            # Calculate average loss
-            avg_loss = epoch_loss / len(train_loader)
-            loss_history.append(avg_loss)
-            print(f"Epoch {epoch + 1}/{start_epoch + num_epochs}, Average Loss: {avg_loss:.6f}")
-
-            # Learning rate scheduling
-            scheduler.step()
-
-            # Visualize samples periodically
-            if (epoch + 1) % visualize_every == 0 or epoch == start_epoch + num_epochs - 1:
-                # Generate samples for both classes
-                for class_idx in range(len(class_names)):
-                    create_diffusion_animation(autoencoder, diffusion, class_idx=class_idx, num_frames=50,
-                                               save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif",
-                                               guidance_scale=3.0)
-
-                    save_path = f"{save_dir}/sample_class_{class_names[class_idx]}_epoch_{epoch + 1}.png"
-                    generate_class_samples(autoencoder, diffusion, target_class=class_idx, num_samples=5,
-                                           save_path=save_path, guidance_scale=3.0)
-
-                    save_path = f"{save_dir}/denoising_path_{class_names[class_idx]}_epoch_{epoch + 1}.png"
-                    visualize_denoising_steps(autoencoder, diffusion, class_idx=class_idx, save_path=save_path,
-                                              guidance_scale=3.0)
-
-                # Save current schedule information
-                if epoch + 1 == start_epoch + transition_epochs[0] or epoch + 1 == start_epoch + \
-                        transition_epochs[1]:
-                    schedule_type = "50_percent_cosine" if epoch + 1 == start_epoch + transition_epochs[
-                        0] else "full_cosine"
-                    torch.save({
-                        'beta': diffusion.beta,
-                        'alpha': diffusion.alpha,
-                        'alpha_bar': diffusion.alpha_bar,
-                        'schedule_type': schedule_type
-                    }, f"{save_dir}/diffusion_schedule_{schedule_type}_epoch_{epoch + 1}.pt")
-
-                # Save checkpoint
-                torch.save(unet.state_dict(), f"{save_dir}/conditional_diffusion_epoch_{epoch + 1}.pt")
-
-        return unet, diffusion, loss_history
-
-    remaining_epochs = total_epochs - start_epoch
-
-    # If no diffusion model is loaded, train a new one
-    if 'diffusion' not in locals():
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            autoencoder, conditional_unet,
-            num_epochs=remaining_epochs,
-            lr=1e-3,
-            visualize_every=100,
-            save_dir=results_dir,
-            start_epoch=start_epoch
+            autoencoder, conditional_unet, num_epochs=800, lr=1e-3,
+            visualize_every=5,  # Visualize every 5 epochs
+            save_dir=results_dir
         )
 
         # Save diffusion model
@@ -2060,39 +1755,19 @@ def main(checkpoint_path=None, total_epochs=10000):
 
         # Plot diffusion loss
         plt.figure(figsize=(8, 5))
-        plt.plot(range(start_epoch + 1, start_epoch + len(diff_losses) + 1),
-                 diff_losses)  # Adjust x-axis for plot
+        plt.plot(diff_losses)
         plt.title('Diffusion Model Training Loss')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.grid(True)
         plt.savefig(f"{results_dir}/diffusion_loss.png")
         plt.close()
-    # If we loaded a model but want to continue training
-    elif start_epoch > 0:
-        # Continue training from the loaded checkpoint
-        conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            autoencoder, conditional_unet, num_epochs=remaining_epochs, lr=1e-3,
-            visualize_every=100,  # Visualize every 100 epochs
-            save_dir=results_dir,
-            start_epoch=start_epoch  # Pass the start epoch
-        )
 
-        # Save diffusion model
-        torch.save(conditional_unet.state_dict(), diffusion_path)
+    # Make sure diffusion is defined
+    if 'diffusion' not in locals():
+        diffusion = ConditionalDenoiseDiffusion(conditional_unet, n_steps=1000, device=device)
 
-        # Plot diffusion loss
-        plt.figure(figsize=(8, 5))
-        plt.plot(range(start_epoch + 1, start_epoch + len(diff_losses) + 1),
-                 diff_losses)  # Adjust x-axis for plot
-        plt.title('Diffusion Model Training Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.grid(True)
-        plt.savefig(f"{results_dir}/diffusion_loss_continued.png")
-        plt.close()
-
-        # Generate sample grid for all classes
+    # Generate sample grid for all classes
     print("Generating sample grid for both cat and dog classes...")
     grid_path = generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir=results_dir)
     print(f"Sample grid saved to: {grid_path}")
@@ -2112,5 +1787,6 @@ def main(checkpoint_path=None, total_epochs=10000):
     for i, path in enumerate(denoising_paths):
         print(f"  - {class_names[i]}: {path}")
 
+
 if __name__ == "__main__":
-    main(total_epochs=10000)
+    main()
