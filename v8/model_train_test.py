@@ -1600,6 +1600,7 @@ def vae_loss(x_recon, x, mu, logvar, kl_weight=0.001, max_kl=50.0, reduction='me
     return total_loss, recon_loss, kl_div
 
 # Main function
+# Main function
 def main(checkpoint_path=None, total_epochs=10000):
     """Main function to run the entire pipeline non-interactively"""
     print("Starting class-conditional diffusion model for CIFAR cats and dogs")
@@ -1628,215 +1629,215 @@ def main(checkpoint_path=None, total_epochs=10000):
     autoencoder = SimpleAutoencoder(in_channels=3, latent_dim=256).to(
         device)  # 3 channels for RGB
 
+    # Define the training function OUTSIDE the conditional block
+    def train_autoencoder(autoencoder, train_loader, num_epochs=100, lr=1e-4, lambda_cls=5.0,
+                          lambda_center=2.0, kl_weight=0.03, visualize_every=100, save_dir="./results"):
+        """Train VAE with separate optimization paths"""
+        print("Starting VAE training with class separation...")
+        os.makedirs(save_dir, exist_ok=True)
+        device = next(autoencoder.parameters()).device
+
+        # Create optimizers - don't share parameters between optimizers
+        recon_optimizer = optim.AdamW(
+            list(autoencoder.encoder.parameters()) +
+            list(autoencoder.decoder.parameters()),
+            lr=lr,
+            weight_decay=1e-5  # Add weight decay for regularization
+        )
+
+        class_optimizer = optim.AdamW(
+            list(autoencoder.classifier.parameters()) +
+            list(autoencoder.center_loss.parameters()),
+            lr=lr * 5,  # Keep the higher learning rate for classifier
+            weight_decay=1e-5  # Same weight decay
+        )
+
+        # Create learning rate schedulers with warmup
+        total_steps = len(train_loader) * num_epochs
+
+        # OneCycleLR provides both warmup and annealing
+        recon_scheduler = OneCycleLR(
+            recon_optimizer,
+            max_lr=lr,
+            total_steps=total_steps,
+            pct_start=0.05,  # 5% of training for warmup
+            anneal_strategy='cos',  # Cosine annealing after warmup
+            div_factor=25.0,  # Initial lr = max_lr/25
+            final_div_factor=10000.0  # Final lr = initial_lr/10000
+        )
+
+        class_scheduler = OneCycleLR(
+            class_optimizer,
+            max_lr=lr * 5,  # Keep the 5x multiplier for classifier
+            total_steps=total_steps,
+            pct_start=0.05,
+            anneal_strategy='cos',
+            div_factor=25.0,
+            final_div_factor=10000.0
+        )
+
+        loss_history = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': []}
+
+        cycle_length = num_epochs // 4
+        R = 0.7
+
+        for epoch in range(num_epochs):
+            autoencoder.train()
+            epoch_recon_loss = 0
+            epoch_kl_loss = 0
+            epoch_class_loss = 0
+            epoch_center_loss = 0
+            epoch_total_loss = 0
+
+            if epoch % cycle_length == 0 and epoch > 0:
+                print(f"Epoch {epoch + 1}: Starting new annealing cycle, resetting optimizer momentum...")
+                for param_group in recon_optimizer.param_groups:
+                    for p in param_group['params']:
+                        if p in recon_optimizer.state:
+                            param_state = recon_optimizer.state[p]
+                            if 'momentum_buffer' in param_state:
+                                param_state['momentum_buffer'].zero_()
+                            if 'exp_avg' in param_state:  # Adam优化器
+                                param_state['exp_avg'].zero_()
+                                param_state['exp_avg_sq'].zero_()
+
+                for param_group in class_optimizer.param_groups:
+                    for p in param_group['params']:
+                        if p in class_optimizer.state:
+                            param_state = class_optimizer.state[p]
+                            if 'momentum_buffer' in param_state:
+                                param_state['momentum_buffer'].zero_()
+                            if 'exp_avg' in param_state:  # Adam优化器
+                                param_state['exp_avg'].zero_()
+                                param_state['exp_avg_sq'].zero_()
+
+            cycle_position = (epoch % cycle_length) / cycle_length
+
+            if cycle_position < R:
+                current_kl_weight = kl_weight * (cycle_position / R)
+            else:
+                current_kl_weight = kl_weight
+
+            print(f"Epoch {epoch + 1}: Using KL weight = {current_kl_weight:.6f}")
+
+            for batch_idx, (data, labels) in enumerate(
+                    tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
+                data = data.to(device)
+                labels = labels.to(device)
+
+                # Step 1: Reconstruction optimization (VAE path)
+                recon_optimizer.zero_grad()
+
+                # Get mu and logvar from encoder
+                mu, logvar = autoencoder.encode_with_params(data)
+
+                # Sample latent vector using reparameterization trick
+                z = autoencoder.reparameterize(mu, logvar)
+
+                # Decode to get reconstruction
+                reconstructed = autoencoder.decode(z)
+
+                # Compute VAE loss (reconstruction + KL divergence)
+                total_loss, recon_loss, kl_loss = vae_loss(
+                    reconstructed, data, mu, logvar, kl_weight=current_kl_weight
+                )
+
+                # Backward pass for reconstruction path
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(autoencoder.encoder.parameters()) + list(autoencoder.decoder.parameters()),
+                    max_norm=0.1
+                )
+                recon_optimizer.step()
+                recon_scheduler.step()  # Step the scheduler after each batch
+
+                # Step 2: Classification optimization
+                class_optimizer.zero_grad()
+
+                # Detach encoder output to prevent gradients flowing back into encoder
+                with torch.no_grad():
+                    mu, logvar = autoencoder.encode_with_params(data)
+                    z = autoencoder.reparameterize(mu, logvar)
+
+                # Forward through classification branch only
+                class_logits = autoencoder.classify(z)
+                class_loss = F.cross_entropy(class_logits, labels)
+                center_loss = autoencoder.compute_center_loss(z, labels)
+
+                # Combined classification loss
+                total_class_loss = lambda_cls * class_loss + lambda_center * center_loss
+                total_class_loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    list(autoencoder.classifier.parameters()) + list(autoencoder.center_loss.parameters()),
+                    max_norm=0.5
+                )
+
+                class_optimizer.step()
+                class_scheduler.step()  # Step the scheduler after each batch
+
+                # Record losses
+                epoch_recon_loss += recon_loss.item()
+                epoch_kl_loss += kl_loss.item()
+                epoch_class_loss += class_loss.item()
+                epoch_center_loss += center_loss.item()
+                epoch_total_loss += total_loss.item()
+
+            # Calculate average losses
+            num_batches = len(train_loader)
+            avg_recon_loss = epoch_recon_loss / num_batches
+            avg_kl_loss = epoch_kl_loss / num_batches
+            avg_class_loss = epoch_class_loss / num_batches
+            avg_center_loss = epoch_center_loss / num_batches
+            avg_total_loss = epoch_total_loss / num_batches
+
+            # Store losses for plotting
+            loss_history['recon'].append(avg_recon_loss)
+            loss_history['kl'].append(avg_kl_loss)
+            loss_history['class'].append(avg_class_loss)
+            loss_history['center'].append(avg_center_loss)
+            loss_history['total'].append(avg_total_loss)
+
+            # Print losses
+            print(f"Epoch {epoch + 1}/{num_epochs}, "
+                  f"Total Loss: {avg_total_loss:.6f}, "
+                  f"Recon Loss: {avg_recon_loss:.6f}, "
+                  f"KL Loss: {avg_kl_loss:.6f}, "
+                  f"Class Loss: {avg_class_loss:.6f}, "
+                  f"Center Loss: {avg_center_loss:.6f}")
+
+            # Visualizations
+            if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
+                visualize_reconstructions(autoencoder, epoch + 1, save_dir)
+                visualize_latent_space(autoencoder, epoch + 1, save_dir)
+
+                # Save checkpoint
+                torch.save(autoencoder.state_dict(), f"{save_dir}/vae_epoch_{epoch + 1}.pt")
+
+        return autoencoder, loss_history
+
     # Check if trained autoencoder exists
     if os.path.exists(autoencoder_path):
         print(f"Loading existing autoencoder from {autoencoder_path}")
         autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device))
         autoencoder.eval()
+        # Create dummy loss history for consistency
+        ae_losses = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': []}
     else:
         print("No existing autoencoder found. Training a new one...")
-
-        # Updated training function for the VAE
-        def train_autoencoder(autoencoder, train_loader, num_epochs=100, lr=1e-4, lambda_cls=5.0,
-                              lambda_center=2.0, kl_weight=0.03, visualize_every=100, save_dir="./results"):
-            """Train VAE with separate optimization paths"""
-            print("Starting VAE training with class separation...")
-            os.makedirs(save_dir, exist_ok=True)
-            device = next(autoencoder.parameters()).device
-
-            # Create optimizers - don't share parameters between optimizers
-            recon_optimizer = optim.AdamW(
-                list(autoencoder.encoder.parameters()) +
-                list(autoencoder.decoder.parameters()),
-                lr=lr,
-                weight_decay=1e-5  # Add weight decay for regularization
-            )
-
-            class_optimizer = optim.AdamW(
-                list(autoencoder.classifier.parameters()) +
-                list(autoencoder.center_loss.parameters()),
-                lr=lr * 5,  # Keep the higher learning rate for classifier
-                weight_decay=1e-5  # Same weight decay
-            )
-
-            # Create learning rate schedulers with warmup
-            total_steps = len(train_loader) * num_epochs
-
-            # OneCycleLR provides both warmup and annealing
-            recon_scheduler = OneCycleLR(
-                recon_optimizer,
-                max_lr=lr,
-                total_steps=total_steps,
-                pct_start=0.05,  # 5% of training for warmup
-                anneal_strategy='cos',  # Cosine annealing after warmup
-                div_factor=25.0,  # Initial lr = max_lr/25
-                final_div_factor=10000.0  # Final lr = initial_lr/10000
-            )
-
-            class_scheduler = OneCycleLR(
-                class_optimizer,
-                max_lr=lr * 5,  # Keep the 5x multiplier for classifier
-                total_steps=total_steps,
-                pct_start=0.05,
-                anneal_strategy='cos',
-                div_factor=25.0,
-                final_div_factor=10000.0
-            )
-
-            loss_history = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': []}
-
-            cycle_length = num_epochs // 4
-            R = 0.7
-
-            for epoch in range(num_epochs):
-                autoencoder.train()
-                epoch_recon_loss = 0
-                epoch_kl_loss = 0
-                epoch_class_loss = 0
-                epoch_center_loss = 0
-                epoch_total_loss = 0
-
-                if epoch % cycle_length == 0 and epoch > 0:
-                    print(f"Epoch {epoch + 1}: Starting new annealing cycle, resetting optimizer momentum...")
-                    for param_group in recon_optimizer.param_groups:
-                        for p in param_group['params']:
-                            if p in recon_optimizer.state:
-                                param_state = recon_optimizer.state[p]
-                                if 'momentum_buffer' in param_state:
-                                    param_state['momentum_buffer'].zero_()
-                                if 'exp_avg' in param_state:  # Adam优化器
-                                    param_state['exp_avg'].zero_()
-                                    param_state['exp_avg_sq'].zero_()
-
-                    for param_group in class_optimizer.param_groups:
-                        for p in param_group['params']:
-                            if p in class_optimizer.state:
-                                param_state = class_optimizer.state[p]
-                                if 'momentum_buffer' in param_state:
-                                    param_state['momentum_buffer'].zero_()
-                                if 'exp_avg' in param_state:  # Adam优化器
-                                    param_state['exp_avg'].zero_()
-                                    param_state['exp_avg_sq'].zero_()
-
-                cycle_position = (epoch % cycle_length) / cycle_length
-
-                if cycle_position < R:
-                    current_kl_weight = kl_weight * (cycle_position / R)
-                else:
-                    current_kl_weight = kl_weight
-
-                print(f"Epoch {epoch + 1}: Using KL weight = {current_kl_weight:.6f}")
-
-                for batch_idx, (data, labels) in enumerate(
-                        tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
-                    data = data.to(device)
-                    labels = labels.to(device)
-
-                    # Step 1: Reconstruction optimization (VAE path)
-                    recon_optimizer.zero_grad()
-
-                    # Get mu and logvar from encoder
-                    mu, logvar = autoencoder.encode_with_params(data)
-
-                    # Sample latent vector using reparameterization trick
-                    z = autoencoder.reparameterize(mu, logvar)
-
-                    # Decode to get reconstruction
-                    reconstructed = autoencoder.decode(z)
-
-                    # Compute VAE loss (reconstruction + KL divergence)
-                    total_loss, recon_loss, kl_loss = vae_loss(
-                        reconstructed, data, mu, logvar, kl_weight=current_kl_weight
-                    )
-
-                    # Backward pass for reconstruction path
-                    total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        list(autoencoder.encoder.parameters()) + list(autoencoder.decoder.parameters()),
-                        max_norm=0.1
-                    )
-                    recon_optimizer.step()
-                    recon_scheduler.step()  # Step the scheduler after each batch
-
-                    # Step 2: Classification optimization
-                    class_optimizer.zero_grad()
-
-                    # Detach encoder output to prevent gradients flowing back into encoder
-                    with torch.no_grad():
-                        mu, logvar = autoencoder.encode_with_params(data)
-                        z = autoencoder.reparameterize(mu, logvar)
-
-                    # Forward through classification branch only
-                    class_logits = autoencoder.classify(z)
-                    class_loss = F.cross_entropy(class_logits, labels)
-                    center_loss = autoencoder.compute_center_loss(z, labels)
-
-                    # Combined classification loss
-                    total_class_loss = lambda_cls * class_loss + lambda_center * center_loss
-                    total_class_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        list(autoencoder.classifier.parameters()) + list(autoencoder.center_loss.parameters()),
-                        max_norm=0.5
-                    )
-
-                    class_optimizer.step()
-                    class_scheduler.step()  # Step the scheduler after each batch
-
-                    # Record losses
-                    epoch_recon_loss += recon_loss.item()
-                    epoch_kl_loss += kl_loss.item()
-                    epoch_class_loss += class_loss.item()
-                    epoch_center_loss += center_loss.item()
-                    epoch_total_loss += total_loss.item()
-
-                # Calculate average losses
-                num_batches = len(train_loader)
-                avg_recon_loss = epoch_recon_loss / num_batches
-                avg_kl_loss = epoch_kl_loss / num_batches
-                avg_class_loss = epoch_class_loss / num_batches
-                avg_center_loss = epoch_center_loss / num_batches
-                avg_total_loss = epoch_total_loss / num_batches
-
-                # Store losses for plotting
-                loss_history['recon'].append(avg_recon_loss)
-                loss_history['kl'].append(avg_kl_loss)
-                loss_history['class'].append(avg_class_loss)
-                loss_history['center'].append(avg_center_loss)
-                loss_history['total'].append(avg_total_loss)
-
-                # Print losses
-                print(f"Epoch {epoch + 1}/{num_epochs}, "
-                      f"Total Loss: {avg_total_loss:.6f}, "
-                      f"Recon Loss: {avg_recon_loss:.6f}, "
-                      f"KL Loss: {avg_kl_loss:.6f}, "
-                      f"Class Loss: {avg_class_loss:.6f}, "
-                      f"Center Loss: {avg_center_loss:.6f}")
-
-                # Visualizations
-                if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
-                    visualize_reconstructions(autoencoder, epoch + 1, save_dir)
-                    visualize_latent_space(autoencoder, epoch + 1, save_dir)
-
-                    # Save checkpoint
-                    torch.save(autoencoder.state_dict(), f"{save_dir}/vae_epoch_{epoch + 1}.pt")
-
-            return autoencoder, loss_history
-
-    # Train autoencoder
-    autoencoder, ae_losses = train_autoencoder(
-        autoencoder,
-        train_loader,  # Add this parameter
-        num_epochs=1000,
-        lr=1e-4,
-        lambda_cls=5.0,
-        lambda_center=2.3,
-        kl_weight=0.035,
-        visualize_every=100,
-        save_dir=results_dir
-    )
-
-    # Save autoencoder
-    torch.save(autoencoder.state_dict(), autoencoder_path)
+        # Train autoencoder
+        autoencoder, ae_losses = train_autoencoder(
+            autoencoder,
+            train_loader,
+            num_epochs=1000,
+            lr=1e-4,
+            lambda_cls=5.0,
+            lambda_center=2.3,
+            kl_weight=0.035,
+            visualize_every=100,
+            save_dir=results_dir
+        )
+        # Save autoencoder
+        torch.save(autoencoder.state_dict(), autoencoder_path)
 
     # Plot autoencoder loss
     plt.figure(figsize=(8, 5))
@@ -1899,9 +1900,9 @@ def main(checkpoint_path=None, total_epochs=10000):
         conditional_unet.apply(init_weights)
         # diffusion variable will be initialized during training
 
-    # Updated train_conditional_diffusion for VAE with start_epoch parameter
+    # Define train_conditional_diffusion function
     def train_conditional_diffusion(autoencoder, unet, num_epochs=100, lr=1e-3, visualize_every=10,
-                                    save_dir="./results", start_epoch=0, transition_epochs=[10000, 10001]):
+                                   save_dir="./results", start_epoch=0, transition_epochs=[10000, 10001]):
         """
         Train the conditional diffusion model with schedule transitions.
 
