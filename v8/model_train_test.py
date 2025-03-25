@@ -117,62 +117,98 @@ class CALayer(nn.Module):
         return x * y
 
 
-# Convolutional Attention Block - building block for encoder/decoder
-class CAB(nn.Module):
-    def __init__(self, n_feat, reduction=16, bias=False):
-        super(CAB, self).__init__()
-        self.body = nn.Sequential(
-            nn.Conv2d(n_feat, n_feat, 3, padding=1, bias=bias),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(n_feat, n_feat, 3, padding=1, bias=bias),
-        )
-        self.ca = CALayer(n_feat, reduction, bias=bias)
-
-    def forward(self, x):
-        res = self.body(x)
-        res = self.ca(res)
-        return res + x  # Residual Connection
-
-
-    def forward(self, z):
-        # z is [batch_size, latent_dim]
-        features = self.fc(z)
-        features = features.view(-1, 64, 8, 8)  # Reshape to [batch_size, 64, 8, 8]
-        return self.decoder(features)
-
-
 # Updated Center Loss for flat latent space
 class CenterLoss(nn.Module):
-    def __init__(self, num_classes=2, feat_dim=128):
+    def __init__(self, num_classes=2, feat_dim=128, min_distance=1.0, repulsion_strength=1.0):
         super(CenterLoss, self).__init__()
         self.num_classes = num_classes
         self.feat_dim = feat_dim
+        self.min_distance = min_distance
+        self.repulsion_strength = repulsion_strength
+
+        # Initialize centers with better separation
         self.centers = nn.Parameter(torch.randn(num_classes, feat_dim))
+
+        # Initialize centers further apart
+        with torch.no_grad():
+            if num_classes == 2:
+                self.centers[0] = -torch.ones(feat_dim) / math.sqrt(feat_dim)
+                self.centers[1] = torch.ones(feat_dim) / math.sqrt(feat_dim)
+            else:
+                for i in range(num_classes):
+                    self.centers[i] = torch.randn(feat_dim)
+                    self.centers[i] = self.centers[i] / torch.norm(self.centers[i]) * 2.0
+
+    def compute_pairwise_distances(self, x, y):
+        """Compute pairwise distances between two sets of vectors without using cdist"""
+        n = x.size(0)
+        m = y.size(0)
+
+        # Compute squared norms
+        x_norm = (x ** 2).sum(1).view(n, 1)
+        y_norm = (y ** 2).sum(1).view(1, m)
+
+        # Compute distance matrix using the formula: ||x-y||^2 = ||x||^2 + ||y||^2 - 2*x·y
+        distmat = x_norm + y_norm - 2.0 * torch.mm(x, y.transpose(0, 1))
+
+        # Apply sqrt and handle numerical stability
+        distmat = torch.clamp(distmat, min=1e-12)
+        distmat = torch.sqrt(distmat)
+
+        return distmat
 
     def forward(self, x, labels):
         batch_size = x.size(0)
 
-        # Apply L2 normalization to features and centers
-        x_norm = F.normalize(x, p=2, dim=1)  # L2 normalization
-        centers_norm = F.normalize(self.centers, p=2, dim=1)
-
-        # Calculate distance matrix using normalized vectors
-        distmat = torch.pow(x_norm, 2).sum(dim=1, keepdim=True).expand(batch_size, self.num_classes) + \
-                  torch.pow(centers_norm, 2).sum(dim=1, keepdim=True).expand(self.num_classes, batch_size).t()
-
-        # Use updated addmm_ syntax with normalized vectors
-        distmat.addmm_(x_norm, centers_norm.t(), beta=1, alpha=-2)
+        # Calculate distance matrix between samples and centers
+        distmat = self.compute_pairwise_distances(x, self.centers)
 
         # Get class mask
         classes = torch.arange(self.num_classes).to(labels.device)
-        labels = labels.unsqueeze(1).expand(batch_size, self.num_classes)
-        mask = labels.eq(classes.expand(batch_size, self.num_classes))
+        labels_expanded = labels.unsqueeze(1).expand(batch_size, self.num_classes)
+        mask = labels_expanded.eq(classes.expand(batch_size, self.num_classes))
 
-        # Apply mask and calculate loss
-        dist = distmat * mask.float()
-        loss = dist.clamp(min=1e-12, max=1e+12).sum() / batch_size
+        # Apply mask and calculate attraction loss
+        attraction_dist = distmat * mask.float()
+        attraction_loss = attraction_dist.sum() / batch_size
 
-        return loss
+        # Calculate repulsion between different class centers
+        center_distances = self.compute_pairwise_distances(self.centers, self.centers)
+
+        # Create a mask for different centers (all except diagonal)
+        diff_mask = 1.0 - torch.eye(self.num_classes, device=x.device)
+
+        # Calculate repulsion loss - penalize centers that are too close
+        repulsion_loss = torch.clamp(self.min_distance - center_distances, min=0.0)
+        repulsion_loss = (repulsion_loss * diff_mask).sum() / (self.num_classes * (self.num_classes - 1) + 1e-6)
+
+        # Add an intra-class variance term to encourage diversity within each class
+        intra_class_variance = 0.0
+        for c in range(self.num_classes):
+            class_mask = (labels == c)
+            if torch.sum(class_mask) > 1:  # Need at least 2 samples for variance
+                class_samples = x[class_mask]
+                class_center = torch.mean(class_samples, dim=0)
+                variance = torch.mean(torch.sum((class_samples - class_center) ** 2, dim=1))
+                intra_class_variance += variance
+
+        if self.num_classes > 0:
+            intra_class_variance = intra_class_variance / self.num_classes
+
+        # Final loss combines attraction, repulsion, and diversity
+        total_loss = attraction_loss + self.repulsion_strength * repulsion_loss - 0.1 * intra_class_variance
+
+        # Store metrics for monitoring (not used in loss calculation)
+        with torch.no_grad():
+            self.avg_center_dist = torch.sum(center_distances * diff_mask) / (
+                        self.num_classes * (self.num_classes - 1) + 1e-6)
+            self.avg_sample_dist = torch.mean(distmat)
+            self.center_attraction = attraction_loss.item()
+            self.center_repulsion = repulsion_loss.item()
+            self.intra_variance = intra_class_variance.item() if isinstance(intra_class_variance,
+                                                                            torch.Tensor) else intra_class_variance
+
+        return total_loss
 
 
 # Define Residual Block
@@ -399,31 +435,20 @@ class ResidualBlock(nn.Module):
 
 # Enhanced SimpleAutoencoder with the updated encoder and decoder
 class SimpleAutoencoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=128, num_classes=2, kl_weight=0.001):
+    # Modify SimpleAutoencoder initialization
+    def __init__(self, in_channels=3, latent_dim=32, num_classes=2, kl_weight=0.01):
         super().__init__()
         self.latent_dim = latent_dim
-        self.kl_weight = kl_weight  # Weight for KL divergence term
+        self.kl_weight = kl_weight
 
-        # Updated encoder and decoder with VAE architecture and skip connections
+        # Encoder and decoder
         self.encoder = Encoder(in_channels, latent_dim)
         self.decoder = Decoder(latent_dim, in_channels)
 
-        # Classifier for latent space
-        self.classifier = nn.Sequential(
-            nn.Linear(latent_dim, 256),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.2),
-            nn.Linear(128, num_classes)
-        )
+        # Classifier (temporarily disabled to focus on basic VAE stability)
+        self.classifier = nn.Linear(latent_dim, num_classes)
 
-        # Center loss with updated feature dimension
-        self.center_loss = CenterLoss(num_classes=num_classes, feat_dim=latent_dim)
-
-        # Apply weight initialization
+        # Initialize weights
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -481,19 +506,26 @@ class SimpleAutoencoder(nn.Module):
         """
         return self.center_loss(z, labels)
 
+    # 1. Simplify kl_divergence - no target approach, just basic calculation with clipping
     def kl_divergence(self, mu, logvar):
-        """
-        Compute KL divergence between N(mu, var) and N(0, 1).
-        """
-        return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1).mean()
+        """Simple KL divergence with strong clipping for stability"""
+        # Clip values to reasonable ranges
+        mu = torch.clamp(mu, min=-5.0, max=5.0)
+        logvar = torch.clamp(logvar, min=-5.0, max=5.0)
+
+        # Standard KL divergence formula
+        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+
+        # Clip any extreme values
+        kl = torch.clamp(kl, min=0.0, max=50.0)
+
+        return kl.mean()
 
     def forward(self, x):
-        """
-        Complete forward pass.
-        """
         mu, logvar, skip_features = self.encoder(x)
         z = self.reparameterize(mu, logvar)
-        x_recon = self.decoder(z, skip_features)
+        # Pass None instead of skip_features
+        x_recon = self.decoder(z, None)
         return x_recon, mu, logvar, z
 
 
@@ -584,7 +616,9 @@ class UNetAttentionBlock(nn.Module):
         out = out.reshape(b, c, h, w)
 
         # Project and add residual
-        return self.proj(out) + residual
+        output = self.proj(out) + residual
+
+        return output
 
 
 # Residual block for UNet with class conditioning
@@ -646,103 +680,89 @@ class SwitchSequential(nn.Sequential):
         return x
 
 
-# Class-Conditional UNet for noise prediction
-# Class-Conditional UNet modified for flat latent space
-# Revised ConditionalUNet for flat latent space with proper dimension handling
 class ConditionalUNet(nn.Module):
-    def __init__(self, latent_dim=128, hidden_dims=[256, 512, 256], time_emb_dim=128, num_classes=2, dropout_rate=0.3):
+    def __init__(self, latent_dim=128, hidden_dims=[256, 512, 256],
+                 time_emb_dim=128, num_classes=2, dropout_rate=0.3):
         super().__init__()
         self.latent_dim = latent_dim
-
-        # Use consistent embedding dimension for time and class
         self.time_emb_dim = time_emb_dim
 
-        # Time embedding with fixed dimension
+        # Time and class embeddings (both with same embedding dimension)
         self.time_emb = TimeEmbedding(n_channels=time_emb_dim)
-
-        # Class embedding with same dimension
         self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=time_emb_dim)
 
-        # Initial projection from latent space to first hidden layer
+        # Initial projection from latent space to first hidden dimension
         self.latent_proj = nn.Linear(latent_dim, hidden_dims[0])
 
-        # Time/class embedding projections for each layer
-        self.time_projections = nn.ModuleList()
-        for dim in hidden_dims:
-            self.time_projections.append(nn.Linear(time_emb_dim, dim))
+        # Create a list of linear layers to project time (and class) embeddings for each layer.
+        # We need one for each layer in hidden_dims.
+        self.time_projections = nn.ModuleList([
+            nn.Linear(time_emb_dim, dim) for dim in hidden_dims
+        ])
 
-        # MLP-based layers
+        # Build a stack of MLP layers.
+        # Each layer is a simple sequential block: a linear layer with dropout and GELU,
+        # followed by a projection to the next hidden dimension.
         self.layers = nn.ModuleList()
-
-        # Build hidden layers
         for i in range(len(hidden_dims) - 1):
-            self.layers.append(
-                nn.ModuleList([
-                    # Residual block at current dimension
-                    nn.Sequential(
-                        nn.Linear(hidden_dims[i], hidden_dims[i]),
-                        nn.LayerNorm(hidden_dims[i]),
-                        nn.Dropout(dropout_rate),
-                        nn.GELU()
-                    ),
-                    # Projection to next dimension
-                    nn.Linear(hidden_dims[i], hidden_dims[i + 1])
-                ])
+            block = nn.Sequential(
+                nn.Linear(hidden_dims[i], hidden_dims[i]),
+                nn.LayerNorm(hidden_dims[i]),
+                nn.Dropout(dropout_rate),
+                nn.GELU()
             )
+            proj = nn.Linear(hidden_dims[i], hidden_dims[i + 1])
+            self.layers.append(nn.ModuleList([block, proj]))
 
-        # Final layer projecting back to latent dimension
+        # One more time projection for the final conditioning
+        self.final_time_proj = nn.Linear(time_emb_dim, hidden_dims[-1])
+        self.final_class_proj = nn.Linear(time_emb_dim, hidden_dims[-1])
+        # Final projection from last hidden dimension back to latent dimension
         self.final = nn.Linear(hidden_dims[-1], latent_dim)
 
-    def forward(self, x, t, c=None):
-        # x is the noisy latent vector: [batch_size, latent_dim]
-        # t is the diffusion timestep
-        # c is the optional class label
+        self.final_norm = nn.LayerNorm(latent_dim)
 
-        # Time embedding
+    def forward(self, x, t, c=None, res_scale=1.0):
+        # x: [batch_size, latent_dim] (noisy latent vector)
+        # t: diffusion timestep tensor
+        # c: optional class labels
+
+        # Save original input for the global residual connection.
+        residual = x
+
+        # Base time embedding and (if provided) class embedding.
         t_emb_base = self.time_emb(t)
+        c_emb_base = self.class_emb(c) if c is not None else None
 
-        # Class embedding (if provided)
-        c_emb_base = None
-        if c is not None:
-            c_emb_base = self.class_emb(c)
-
-        # Initial projection
+        # Project input into hidden dimension.
         h = self.latent_proj(x)
 
-        # Process through layers with proper projection of embeddings
-        for i, (residual, downsample) in enumerate(self.layers):
-            # Project time embedding to current hidden dimension
+        # Process through each layer.
+        for i, (block, downsample) in enumerate(self.layers):
+            # Add time conditioning (and class conditioning if available).
             t_emb = self.time_projections[i](t_emb_base)
-
-            # Add time conditioning
             h = h + t_emb
-
-            # Add class conditioning if provided
             if c_emb_base is not None:
-                # Project class embedding to same dimension as time embedding
                 c_emb = self.time_projections[i](c_emb_base)
                 h = h + c_emb
 
-            # Apply residual block
-            h = h + residual(h)
-
-            # Apply projection to next dimension
+            # Pass through the block and then downsample.
+            h = block(h)
             h = downsample(h)
 
-        # Final time and class embedding addition
-        t_emb_final = self.time_projections[-1](t_emb_base)
+        # Final conditioning before mapping back to latent space.
+        t_emb_final = self.final_time_proj(t_emb_base)
         h = h + t_emb_final
-
         if c_emb_base is not None:
-            c_emb_final = self.time_projections[-1](c_emb_base)
+            c_emb_final = self.final_class_proj(c_emb_base)
             h = h + c_emb_final
 
-        # Final projection back to latent dimension
-        return self.final(h)
+        # Map back to latent dimension and add the global skip connection.
+        out = self.final(h)
+        return (out + self.final(residual) * res_scale) / (1 + res_scale)
 
 
 # Class-conditional diffusion model
-# Modified diffusion model for flat latent space
 class ConditionalDenoiseDiffusion():
     def __init__(self, eps_model, n_steps=1000, device=None):
         super().__init__()
@@ -799,20 +819,13 @@ class ConditionalDenoiseDiffusion():
 
         return x
 
-    def loss(self, x0, labels=None):
-        """Calculate noise prediction loss with optional class conditioning"""
+    def loss(self, x0, labels=None, res_scale=1.0):
         batch_size = x0.shape[0]
-
-        # Random timestep for each sample
         t = torch.randint(0, self.n_steps, (batch_size,), device=x0.device, dtype=torch.long)
-
-        # Add noise
         eps = torch.randn_like(x0)
         xt = self.q_sample(x0, t, eps)
-
-        # Predict noise (with class conditioning if labels provided)
-        eps_theta = self.eps_model(xt, t, labels)
-
+        # Pass the residual scaling factor into the eps_model (i.e. your conditional UNet)
+        eps_theta = self.eps_model(xt, t, labels, res_scale=res_scale)
         return euclidean_distance_loss(eps, eps_theta)
 
 
@@ -923,7 +936,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
         for images, labels in test_loader:
             images = images.to(device)
             # For VAE, use the mean vectors for consistency
-            mu, _ = autoencoder.encoder(images)
+            mu, _, _ = autoencoder.encoder(images)
             all_latents.append(mu.detach().cpu().numpy())
             all_labels.append(labels.numpy())
 
@@ -1196,7 +1209,8 @@ def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
         for images, labels in test_loader:
             images = images.to(device)
             # For VAE, we want the mean vectors for consistency
-            mu, _ = autoencoder.encode_with_params(images)
+            # Unpack the three returned values properly
+            mu, logvar, _ = autoencoder.encode_with_params(images)
             all_latents.append(mu.cpu().numpy())
             all_labels.append(labels.numpy())
 
@@ -1438,43 +1452,11 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
     return save_path
 
 
-# Updated function to compute VAE loss (reconstruction + KL divergence)
-def vae_loss(x_recon, x, mu, logvar, kl_weight=0.001, reduction='mean'):
-    """
-    Compute VAE loss with reconstruction and KL divergence terms.
-
-    Args:
-        x_recon: Reconstructed tensor
-        x: Original tensor
-        mu: Mean of latent distribution
-        logvar: Log variance of latent distribution
-        kl_weight: Weight for KL divergence term
-        reduction: 'mean', 'sum', or 'none'
-
-    Returns:
-        Total loss, reconstruction loss, and KL divergence
-    """
-    # Reconstruction loss (using Euclidean distance)
-    squared_diff = (x_recon - x) ** 2
-    squared_dist = squared_diff.view(x.size(0), -1).sum(dim=1)
-    recon_loss = torch.sqrt(squared_dist + 1e-8)  # Add small epsilon to avoid numerical instability
-
-    # KL divergence
-    kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
-
-    # Total loss
-    if reduction == 'mean':
-        total_loss = recon_loss.mean() + kl_weight * kl_div.mean()
-        recon_loss = recon_loss.mean()
-        kl_div = kl_div.mean()
-    elif reduction == 'sum':
-        total_loss = recon_loss.sum() + kl_weight * kl_div.sum()
-        recon_loss = recon_loss.sum()
-        kl_div = kl_div.sum()
-    else:  # 'none'
-        total_loss = recon_loss + kl_weight * kl_div
-
-    return total_loss, recon_loss, kl_div
+def compute_res_scale(epoch, total_epochs, initial=5.0, final=1.0):
+    # Linear decay: at epoch 0, returns initial; at final epoch, returns final.
+    if epoch < 20:
+        return 0
+    return initial + (final - initial) * max(0, 1 - epoch / total_epochs)
 
 # Main function
 def main():
@@ -1501,7 +1483,7 @@ def main():
     diffusion_path = f"{results_dir}/conditional_diffusion_final.pt"
 
     # Create autoencoder
-    autoencoder = SimpleAutoencoder(in_channels=3).to(device)  # 3 channels for RGB
+    autoencoder = SimpleAutoencoder(in_channels=3, latent_dim=128).to(device)  # 3 channels for RGB
 
     # Check if trained autoencoder exists
     if os.path.exists(autoencoder_path):
@@ -1512,19 +1494,15 @@ def main():
         print("No existing autoencoder found. Training a new one...")
 
         # Updated training function for the VAE
-        def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4, lambda_cls=5.0, lambda_center=2.0,
-                              kl_weight=0.001, visualize_every=1, save_dir="./results"):
-            """Train VAE with separate optimization paths"""
-            print("Starting VAE training with class separation...")
+        def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-6, lambda_cls=5.0,
+                              lambda_center=2.0, kl_weight=0.01, visualize_every=1, save_dir="./results"):
+            """Simplified training function that maintains compatibility with main()"""
+            print("Starting VAE training with focus on stability...")
             os.makedirs(save_dir, exist_ok=True)
             device = next(autoencoder.parameters()).device
 
-            # Create optimizers - don't share parameters between optimizers
-            recon_optimizer = optim.Adam(list(autoencoder.encoder.parameters()) +
-                                         list(autoencoder.decoder.parameters()), lr=lr)
-
-            class_optimizer = optim.Adam(list(autoencoder.classifier.parameters()) +
-                                         list(autoencoder.center_loss.parameters()), lr=lr * 5)
+            # Single optimizer with extremely low learning rate
+            optimizer = optim.Adam(autoencoder.parameters(), lr=lr)
 
             loss_history = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': []}
 
@@ -1536,89 +1514,117 @@ def main():
                 epoch_center_loss = 0
                 epoch_total_loss = 0
 
-                for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
+                print(f"Epoch {epoch + 1}/{num_epochs}")
+
+                for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Training")):
                     data = data.to(device)
                     labels = labels.to(device)
 
-                    # Step 1: Reconstruction optimization (VAE path)
-                    recon_optimizer.zero_grad()
+                    # Basic VAE steps
+                    optimizer.zero_grad()
 
-                    # Get mu, logvar, and skip features from encoder
+                    # Encoder forward pass
                     mu, logvar, skip_features = autoencoder.encode_with_params(data)
 
-                    # Sample latent vector using reparameterization trick
+                    # Reparameterization
                     z = autoencoder.reparameterize(mu, logvar)
 
-                    # Decode to get reconstruction, using skip features
-                    reconstructed = autoencoder.decode(z, skip_features)
+                    # Phase 1: No skip connections (first 20 epochs)
+                    if epoch < 20:
+                        reconstructed = autoencoder.decode(z, None)
+                    else:
+                        # Phase 2: With skip connections (after epoch 20)
+                        reconstructed = autoencoder.decode(z, skip_features)
 
-                    # Compute VAE loss (reconstruction + KL divergence)
+                    # Basic losses only for first 10 epochs
                     recon_loss = euclidean_distance_loss(reconstructed, data)
-                    kl_loss = autoencoder.kl_divergence(mu, logvar)
-                    total_loss = recon_loss + kl_weight * kl_loss
 
-                    # Backward pass for reconstruction path
+                    # Clip mu and logvar for KL calculation
+                    mu_clipped = torch.clamp(mu, min=-5.0, max=5.0)
+                    logvar_clipped = torch.clamp(logvar, min=-5.0, max=5.0)
+                    kl_loss = -0.5 * torch.sum(1 + logvar_clipped - mu_clipped.pow(2) - logvar_clipped.exp(),
+                                               dim=1).mean()
+
+                    # Start with very low KL weight and increase it slowly
+                    current_kl_weight = kl_weight * min(1.0, epoch / 20)
+
+                    # Only add classification after basic VAE is stable
+                    if epoch < 10:
+                        # Skip classification and center loss for first few epochs
+                        class_loss = torch.tensor(0.0, device=device)
+                        center_loss = torch.tensor(0.0, device=device)
+                        total_loss = recon_loss + current_kl_weight * kl_loss
+                    else:
+                        # Add classification with lowered weight
+                        class_logits = autoencoder.classify(z)
+                        class_loss = F.cross_entropy(class_logits, labels)
+
+                        # IMPORTANT: Replace the problematic center_loss with a simple L2 distance
+                        # This avoids the numerical instability in your original CenterLoss implementation
+                        if epoch < 20:
+                            # Skip center loss completely for a while
+                            center_loss = torch.tensor(0.0, device=device)
+                        else:
+                            # Very simplified center loss calculation
+                            centers = torch.zeros(2, z.size(1), device=device)  # 2 classes
+                            # Compute class centers
+                            for c in range(2):
+                                mask = (labels == c)
+                                if mask.sum() > 0:
+                                    centers[c] = z[mask].mean(dim=0)
+                            # Compute distance to centers
+                            class_centers = centers[labels]
+                            center_loss = torch.mean((z - class_centers).pow(2).sum(dim=1))
+                            # Use a much smaller weight for center loss
+                            lambda_center = lambda_center * 0.01
+
+                        # Full loss with carefully scaled components
+                        total_loss = recon_loss + current_kl_weight * kl_loss + \
+                                     lambda_cls * 0.1 * class_loss + \
+                                     lambda_center * center_loss
+
+                    # Skip problematic batches
+                    if torch.isnan(total_loss) or torch.isinf(total_loss):
+                        print(f"Skipping batch {batch_idx} - invalid loss value")
+                        continue
+
+                    # Backward and optimize with tight gradient clipping
                     total_loss.backward()
-                    recon_optimizer.step()
+                    torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=0.1)
+                    optimizer.step()
 
-                    # Step 2: Classification optimization
-                    class_optimizer.zero_grad()
-
-                    # Detach encoder output to prevent gradients flowing back into encoder
-                    with torch.no_grad():
-                        mu, logvar, _ = autoencoder.encode_with_params(data)
-                        z = autoencoder.reparameterize(mu, logvar)
-
-                    # Forward through classification branch only
-                    class_logits = autoencoder.classify(z)
-                    class_loss = F.cross_entropy(class_logits, labels)
-                    center_loss = autoencoder.compute_center_loss(z, labels)
-
-                    # Combined classification loss
-                    total_class_loss = lambda_cls * class_loss + lambda_center * center_loss
-                    total_class_loss.backward()
-
-                    # Add gradient clipping here, before optimizer step
-                    torch.nn.utils.clip_grad_norm_(autoencoder.classifier.parameters(), max_norm=1.0)
-
-                    class_optimizer.step()
-
-                    # Record losses
+                    # Safe recording of losses
                     epoch_recon_loss += recon_loss.item()
                     epoch_kl_loss += kl_loss.item()
-                    epoch_class_loss += class_loss.item()
-                    epoch_center_loss += center_loss.item()
+                    epoch_class_loss += class_loss.item() if isinstance(class_loss, torch.Tensor) else 0
+                    epoch_center_loss += center_loss.item() if isinstance(center_loss, torch.Tensor) else 0
                     epoch_total_loss += total_loss.item()
 
-                # Calculate average losses
+                # Average losses
                 num_batches = len(train_loader)
-                avg_recon_loss = epoch_recon_loss / num_batches
-                avg_kl_loss = epoch_kl_loss / num_batches
-                avg_class_loss = epoch_class_loss / num_batches
-                avg_center_loss = epoch_center_loss / num_batches
-                avg_total_loss = epoch_total_loss / num_batches
+                epoch_losses = {
+                    'recon': epoch_recon_loss / num_batches,
+                    'kl': epoch_kl_loss / num_batches,
+                    'class': epoch_class_loss / num_batches,
+                    'center': epoch_center_loss / num_batches,
+                    'total': epoch_total_loss / num_batches
+                }
 
-                # Store losses for plotting
-                loss_history['recon'].append(avg_recon_loss)
-                loss_history['kl'].append(avg_kl_loss)
-                loss_history['class'].append(avg_class_loss)
-                loss_history['center'].append(avg_center_loss)
-                loss_history['total'].append(avg_total_loss)
+                # Store in history
+                for k, v in epoch_losses.items():
+                    loss_history[k].append(v)
 
-                # Print losses
                 print(f"Epoch {epoch + 1}/{num_epochs}, "
-                      f"Total Loss: {avg_total_loss:.6f}, "
-                      f"Recon Loss: {avg_recon_loss:.6f}, "
-                      f"KL Loss: {avg_kl_loss:.6f}, "
-                      f"Class Loss: {avg_class_loss:.6f}, "
-                      f"Center Loss: {avg_center_loss:.6f}")
+                      f"Total Loss: {epoch_losses['total']:.6f}, "
+                      f"Recon Loss: {epoch_losses['recon']:.6f}, "
+                      f"KL Loss: {epoch_losses['kl']:.6f}, "
+                      f"Class Loss: {epoch_losses['class']:.6f}, "
+                      f"Center Loss: {epoch_losses['center']:.6f}")
 
-                # Visualizations
+                # Visualizations and checkpoints
                 if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
                     visualize_reconstructions(autoencoder, epoch + 1, save_dir)
                     visualize_latent_space(autoencoder, epoch + 1, save_dir)
-
-                    # Save checkpoint
                     torch.save(autoencoder.state_dict(), f"{save_dir}/vae_epoch_{epoch + 1}.pt")
 
             return autoencoder, loss_history
@@ -1631,7 +1637,7 @@ def main():
             lr=1e-4,
             lambda_cls=5.0,
             lambda_center=2.0,
-            visualize_every=5,
+            visualize_every=10,
             save_dir=results_dir
         )
 
@@ -1686,16 +1692,17 @@ def main():
 
             # Create diffusion model
             diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device)
-            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-2)
-            scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                optimizer, max_lr=1e-3, total_steps=num_epochs * len(train_loader),
-                pct_start=0.1  # Warm-up for 10% of training
-            )
+            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-4)
+            # T_0: number of iterations (or epochs) before the first restart.
+            # T_mult: factor by which the period increases after each restart.
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
             # Training loop
             loss_history = []
 
             for epoch in range(num_epochs):
+                # Compute the current residual scaling factor
+                current_res_scale = compute_res_scale(epoch, num_epochs, initial=0.5, final=1)
                 epoch_loss = 0
 
                 for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
@@ -1705,10 +1712,10 @@ def main():
                     # Encode images to latent space using VAE
                     with torch.no_grad():
                         # Use the sample from encoding function
-                        latents = autoencoder.encode(data)
+                        latents, _ = autoencoder.encode(data)
 
                     # Calculate diffusion loss with class conditioning
-                    loss = diffusion.loss(latents, labels)
+                    loss = diffusion.loss(latents, labels, res_scale=current_res_scale)
 
                     # Backward pass
                     optimizer.zero_grad()
@@ -1724,7 +1731,7 @@ def main():
                 print(f"Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.6f}")
 
                 # Learning rate scheduling
-                scheduler.step()
+                scheduler.step(int(epoch + batch_idx / len(train_loader)))
 
                 # Visualize samples periodically
                 if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
@@ -1745,8 +1752,8 @@ def main():
 
         # Train conditional diffusion model
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            autoencoder, conditional_unet, num_epochs=800, lr=1e-3,
-            visualize_every=5,  # Visualize every 5 epochs
+            autoencoder, conditional_unet, num_epochs=500, lr=1e-3,
+            visualize_every=10,  # Visualize every 10 epochs
             save_dir=results_dir
         )
 
