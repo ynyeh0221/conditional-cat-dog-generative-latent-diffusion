@@ -21,7 +21,6 @@ np.random.seed(42)
 # Set image size for CIFAR (32x32 RGB images)
 img_size = 32
 
-# 改進數據處理：使用更強的數據增強
 transform_train = transforms.Compose([
     transforms.Resize((img_size, img_size)),
     transforms.RandomHorizontalFlip(),
@@ -35,8 +34,7 @@ transform_test = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-# 減小批次大小以獲得更好的訓練穩定性
-batch_size = 128  # 從256改為128
+batch_size = 128
 
 # Define class names for CIFAR cats and dogs
 class_names = ['Cat', 'Dog']
@@ -76,7 +74,6 @@ def create_cat_dog_dataset(cifar_dataset):
     return CatDogDataset(cifar_dataset, cat_dog_indices)
 
 
-# 改進激活函數：使用Swish替代ReLU
 class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
@@ -84,14 +81,14 @@ class Swish(nn.Module):
 
 # Channel Attention Layer for improved feature selection
 class CALayer(nn.Module):
-    def __init__(self, channel, reduction=8):  # 從16改成8，增強注意力機制
+    def __init__(self, channel, reduction=8):
         super(CALayer, self).__init__()
         # Global average pooling: feature --> point
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         # Feature channel downscale and upscale --> channel weight
         self.conv_du = nn.Sequential(
             nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=False),
-            Swish(),  # 使用Swish替代ReLU
+            Swish(),
             nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=False),
             nn.Sigmoid()
         )
@@ -102,7 +99,6 @@ class CALayer(nn.Module):
         return x * y
 
 
-# 空間注意力模塊，用於提高特徵的空間關注度
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super(SpatialAttention, self).__init__()
@@ -110,7 +106,6 @@ class SpatialAttention(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # 生成空間注意力圖
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         attention = torch.cat([avg_out, max_out], dim=1)
@@ -219,27 +214,25 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
         self.bn1 = nn.BatchNorm2d(channels)
-        self.swish = Swish()  # 使用Swish替代ReLU
+        self.swish = Swish()
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
         self.bn2 = nn.BatchNorm2d(channels)
-        self.ca = CALayer(channels)  # 添加通道注意力層
-        self.sa = SpatialAttention()  # 添加空間注意力層
+        self.ca = CALayer(channels)
+        self.sa = SpatialAttention()
 
     def forward(self, x):
         residual = x
         out = self.swish(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out = self.ca(out)  # 應用通道注意力
-        out = self.sa(out)  # 應用空間注意力
+        out = self.ca(out)
+        out = self.sa(out)
         out += residual
         out = self.swish(out)
         return out
 
 
-# 改進編碼器：增加網絡容量，添加殘差塊和注意力機制
-# 改進編碼器：增加網絡容量，添加殘差塊和注意力機制
 class Encoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=256):  # 增加潛在空間維度
+    def __init__(self, in_channels=3, latent_dim=256):
         super().__init__()
         self.latent_dim = latent_dim
 
@@ -250,10 +243,8 @@ class Encoder(nn.Module):
             Swish()
         )
 
-        # 保存中間特徵用於跳躍連接
         self.skip_features = []
 
-        # 第一個下采樣塊
         self.down1 = nn.Sequential(
             nn.Conv2d(64, 128, 4, stride=2, padding=1),
             nn.GroupNorm(16, 128),
@@ -261,7 +252,6 @@ class Encoder(nn.Module):
         )
         self.res1 = ResidualBlock(128)
 
-        # 第二個下采樣塊
         self.down2 = nn.Sequential(
             nn.Conv2d(128, 256, 4, stride=2, padding=1),
             nn.GroupNorm(32, 256),
@@ -269,7 +259,6 @@ class Encoder(nn.Module):
         )
         self.res2 = ResidualBlock(256)
 
-        # 第三個下采樣塊
         self.down3 = nn.Sequential(
             nn.Conv2d(256, 512, 4, stride=2, padding=1),
             nn.GroupNorm(32, 512),
@@ -277,7 +266,6 @@ class Encoder(nn.Module):
         )
         self.res3 = ResidualBlock(512)
 
-        # 全連接層用於均值和方差
         self.fc_mu = nn.Sequential(
             nn.Linear(512 * 4 * 4, 512),
             nn.LayerNorm(512),
@@ -293,45 +281,36 @@ class Encoder(nn.Module):
         )
 
     def forward(self, x):
-        # 清空跳躍連接特徵列表
         self.skip_features = []
 
-        # 初始卷積
         x = self.initial_conv(x)
         self.skip_features.append(x)
 
-        # 第一個下採樣塊
         x = self.down1(x)
         x = self.res1(x)
         self.skip_features.append(x)
 
-        # 第二個下採樣塊
         x = self.down2(x)
         x = self.res2(x)
         self.skip_features.append(x)
 
-        # 第三個下採樣塊
         x = self.down3(x)
         x = self.res3(x)
         self.skip_features.append(x)
 
-        # 扁平化
         x_flat = x.view(x.size(0), -1)
 
-        # 計算均值和對數方差
         mu = self.fc_mu(x_flat)
         logvar = self.fc_logvar(x_flat)
 
         return mu, logvar
 
 
-# 改進解碼器：增加網絡容量，添加跳躍連接
 class Decoder(nn.Module):
-    def __init__(self, latent_dim=256, out_channels=3):  # 增加潛在空間維度
+    def __init__(self, latent_dim=256, out_channels=3):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # 從潛在空間投影到初始特徵體積
         self.fc = nn.Sequential(
             nn.Linear(latent_dim, 512),
             nn.LayerNorm(512),
@@ -341,10 +320,8 @@ class Decoder(nn.Module):
             Swish()
         )
 
-        # 殘差塊和注意力塊
         self.res3 = ResidualBlock(512)
 
-        # 第一個上採樣塊：4x4x512 -> 8x8x256
         self.up3 = nn.Sequential(
             nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),
             nn.GroupNorm(32, 256),
@@ -352,7 +329,6 @@ class Decoder(nn.Module):
         )
         self.res2 = ResidualBlock(256)
 
-        # 第二個上採樣塊：8x8x256 -> 16x16x128
         self.up2 = nn.Sequential(
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
             nn.GroupNorm(16, 128),
@@ -360,42 +336,34 @@ class Decoder(nn.Module):
         )
         self.res1 = ResidualBlock(128)
 
-        # 第三個上採樣塊：16x16x128 -> 32x32x64
         self.up1 = nn.Sequential(
             nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
             nn.GroupNorm(8, 64),
             Swish()
         )
 
-        # 最終卷積層到RGB通道
         self.final_conv = nn.Sequential(
             nn.Conv2d(64, 32, 3, padding=1),
             nn.GroupNorm(8, 32),
             Swish(),
             nn.Conv2d(32, out_channels, 3, padding=1),
-            nn.Sigmoid()  # 輸出範圍 [0, 1]
+            nn.Sigmoid()
         )
 
     def forward(self, z, encoder_features=None):
-        # 投影並重塑
         x = self.fc(z)
         x = x.view(-1, 512, 4, 4)
 
-        # 應用殘差塊
         x = self.res3(x)
 
-        # 第一個上採樣塊
         x = self.up3(x)
         x = self.res2(x)
 
-        # 第二個上採樣塊
         x = self.up2(x)
         x = self.res1(x)
 
-        # 第三個上採樣塊
         x = self.up1(x)
 
-        # 最終卷積到RGB通道
         x = self.final_conv(x)
 
         return x
@@ -432,19 +400,15 @@ def euclidean_distance_loss(x, y, reduction='mean'):
         return euclidean_dist
 
 
-# 改進的SimpleAutoencoder (VAE)
-# 改進的SimpleAutoencoder (VAE)
 class SimpleAutoencoder(nn.Module):
     def __init__(self, in_channels=3, latent_dim=256, num_classes=2, kl_weight=0.0005):  # 增加潛在空間維度
         super().__init__()
         self.latent_dim = latent_dim
         self.kl_weight = kl_weight
 
-        # 編碼器和解碼器
         self.encoder = Encoder(in_channels, latent_dim)
         self.decoder = Decoder(latent_dim, in_channels)
 
-        # 分類器
         self.classifier = nn.Sequential(
             nn.Linear(latent_dim, 512),
             nn.LayerNorm(512),
@@ -457,17 +421,13 @@ class SimpleAutoencoder(nn.Module):
             nn.Linear(256, num_classes)
         )
 
-        # 用於中心損失
         self.register_buffer('class_centers', torch.zeros(num_classes, latent_dim))
         self.register_buffer('center_counts', torch.zeros(num_classes))
 
-        # 初始化權重
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        # 使用適當的初始化方法
         if isinstance(m, nn.Linear):
-            # 線性層使用Kaiming初始化
             nn.init.kaiming_normal_(m.weight, a=0.2)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -475,7 +435,6 @@ class SimpleAutoencoder(nn.Module):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-            # 卷積層也使用Kaiming初始化
             nn.init.kaiming_normal_(m.weight, a=0.2)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -484,7 +443,6 @@ class SimpleAutoencoder(nn.Module):
         """
         Reparameterization trick with numerical stability improvements.
         """
-        # 限制logvar以防止數值問題
         logvar = torch.clamp(logvar, min=-2.0, max=10.0)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
@@ -499,13 +457,11 @@ class SimpleAutoencoder(nn.Module):
     def encode_with_params(self, x):
         """Return distribution parameters for computing KL divergence loss."""
         mu, logvar = self.encoder(x)
-        # 同樣限制logvar
         logvar = torch.clamp(logvar, min=-2.0, max=10.0)
         return mu, logvar
 
     def decode(self, z):
         """Decode latent vector to reconstruction."""
-        # 使用編碼器的跳躍連接特徵
         encoder_features = getattr(self, 'stored_encoder_features', None)
         return self.decoder(z, encoder_features)
 
@@ -550,16 +506,13 @@ class SimpleAutoencoder(nn.Module):
         if torch.isnan(mu).any() or torch.isnan(logvar).any():
             print("NaN detected in mu or logvar!")
 
-        # 限制值以保持穩定性
         mu = torch.clamp(mu, min=-10.0, max=10.0)
         logvar = torch.clamp(logvar, min=-2.0, max=10.0)
 
-        # KL散度公式
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
 
-        # 進一步穩定性：剪裁極端值並取平均
         kl_loss = torch.clamp(kl_loss, min=0.0, max=100.0).mean()
-        mu_reg = 1e-4 * torch.sum(mu.pow(2))  # mu的L2正則化
+        mu_reg = 1e-4 * torch.sum(mu.pow(2))
         return kl_loss + mu_reg
 
     def forward(self, x):
@@ -567,7 +520,6 @@ class SimpleAutoencoder(nn.Module):
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
 
-        # 保存編碼器特徵用於跳躍連接
         self.stored_encoder_features = self.encoder.skip_features
 
         x_recon = self.decoder(z, self.encoder.skip_features)
@@ -583,11 +535,11 @@ class Swish(nn.Module):
 # Time embedding for diffusion model
 # Revised TimeEmbedding for flat latent space
 class TimeEmbedding(nn.Module):
-    def __init__(self, n_channels=256):  # 增加通道數量
+    def __init__(self, n_channels=256):
         super().__init__()
         self.n_channels = n_channels
         self.lin1 = nn.Linear(self.n_channels, self.n_channels * 2)
-        self.act = Swish()  # 使用Swish替代
+        self.act = Swish()
         self.lin2 = nn.Linear(self.n_channels * 2, self.n_channels)
 
     def forward(self, t):
@@ -609,11 +561,11 @@ class TimeEmbedding(nn.Module):
 
 # Revised ClassEmbedding for flat latent space
 class ClassEmbedding(nn.Module):
-    def __init__(self, num_classes=2, n_channels=256):  # 增加通道數量
+    def __init__(self, num_classes=2, n_channels=256):
         super().__init__()
         self.embedding = nn.Embedding(num_classes, n_channels)
         self.lin1 = nn.Linear(n_channels, n_channels)
-        self.act = Swish()  # 使用Swish替代
+        self.act = Swish()
         self.lin2 = nn.Linear(n_channels, n_channels)
 
     def forward(self, c):
@@ -668,7 +620,7 @@ class UNetAttentionBlock(nn.Module):
 
 # Residual block for UNet with class conditioning
 class UNetResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, d_time=256, num_groups=8, dropout_rate=0.2):  # 增加時間維度
+    def __init__(self, in_channels, out_channels, d_time=256, num_groups=8, dropout_rate=0.2):
         super().__init__()
 
         # Feature normalization and convolution
@@ -678,7 +630,7 @@ class UNetResidualBlock(nn.Module):
         # Time and class embedding projections
         self.time_emb = nn.Linear(d_time, out_channels)
         self.class_emb = nn.Linear(d_time, out_channels)  # Same dimension as time embedding
-        self.act = Swish()  # 使用Swish替代
+        self.act = Swish()
 
         self.dropout = nn.Dropout(dropout_rate)
 
@@ -726,8 +678,8 @@ class SwitchSequential(nn.Sequential):
 
 
 class ConditionalUNet(nn.Module):
-    def __init__(self, latent_dim=256, hidden_dims=[256, 512, 1024, 512, 256],  # 增加隱藏層維度
-                 time_emb_dim=256, num_classes=2, dropout_rate=0.3):  # 增加時間嵌入維度
+    def __init__(self, latent_dim=256, hidden_dims=[256, 512, 1024, 512, 256],
+                 time_emb_dim=256, num_classes=2, dropout_rate=0.3):
         super().__init__()
         self.latent_dim = latent_dim
         self.time_emb_dim = time_emb_dim
@@ -745,7 +697,6 @@ class ConditionalUNet(nn.Module):
             nn.Linear(time_emb_dim, dim) for dim in hidden_dims
         ])
 
-        # 添加注意力層
         self.attention_layers = nn.ModuleList([
             nn.MultiheadAttention(embed_dim=dim, num_heads=8, dropout=dropout_rate)
             for dim in hidden_dims
@@ -754,18 +705,15 @@ class ConditionalUNet(nn.Module):
         # Build a stack of MLP layers with attention and residual connections
         self.layers = nn.ModuleList()
         for i in range(len(hidden_dims) - 1):
-            # 每層包含一個帶Swish激活的殘差塊、注意力塊和下一層投影
             residual_block = nn.Sequential(
                 nn.Linear(hidden_dims[i], hidden_dims[i]),
                 nn.LayerNorm(hidden_dims[i]),
                 nn.Dropout(dropout_rate),
-                Swish()  # 使用Swish替代GELU
+                Swish()
             )
 
-            # 層標準化用於注意力機制
             layer_norm = nn.LayerNorm(hidden_dims[i])
 
-            # 投影到下一層維度
             proj = nn.Linear(hidden_dims[i], hidden_dims[i + 1])
 
             self.layers.append(nn.ModuleList([residual_block, layer_norm, proj]))
@@ -774,7 +722,6 @@ class ConditionalUNet(nn.Module):
         self.final_time_proj = nn.Linear(time_emb_dim, hidden_dims[-1])
         self.final_class_proj = nn.Linear(time_emb_dim, hidden_dims[-1])
 
-        # 添加最終層標準化
         self.final_norm = nn.LayerNorm(hidden_dims[-1])
 
         # Final projection from last hidden dimension back to latent dimension
@@ -807,15 +754,14 @@ class ConditionalUNet(nn.Module):
             # Pass through the residual block
             h_residual = h
             h = block(h)
-            h = h + h_residual  # 殘差連接
+            h = h + h_residual
 
-            # 應用注意力機制 (reshape for MultiheadAttention)
+            # reshape for MultiheadAttention
             h_norm = layer_norm(h)
             h_attn = h_norm.unsqueeze(1)  # [batch, 1, dim]
             h_attn, _ = self.attention_layers[i](h_attn, h_attn, h_attn)
-            h = h + h_attn.squeeze(1)  # 殘差連接
+            h = h + h_attn.squeeze(1)
 
-            # 投影到下一層維度
             h = downsample(h)
 
         # Final conditioning before mapping back to latent space.
@@ -825,7 +771,6 @@ class ConditionalUNet(nn.Module):
             c_emb_final = self.final_class_proj(c_emb_base)
             h = h + c_emb_final
 
-        # 最終層標準化
         h = self.final_norm(h)
 
         # Map back to latent dimension and add the global skip connection.
@@ -973,7 +918,6 @@ def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./res
 
 
 # Visualize latent space denoising process for a specific class
-# Modified visualize_denoising_steps for VAE
 def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None):
     """
     Visualize both the denoising process and the corresponding path in latent space for VAE.
@@ -1260,7 +1204,6 @@ def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
     autoencoder.train()
 
 
-# Visualize latent space with t-SNE
 # Visualize latent space with t-SNE
 def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
     """Visualize the latent space of the VAE using t-SNE"""
@@ -1562,7 +1505,6 @@ class VGGPerceptualLoss(nn.Module):
         return self.criterion(x_features, y_features)
 
 
-# 改進的訓練函數，使用分階段訓練和更好的學習率調度
 def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
                       lambda_cls=0.5, lambda_center=0.1, lambda_vgg=0.1,
                       kl_weight_start=0.0001, kl_weight_end=0.01,
@@ -1633,7 +1575,7 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
             elif epoch < 60:
                 # Stage 3: Full KL weight, start introducing classification
                 kl_factor = 1.0
-                cls_factor = min(1.0, (epoch - 40) / 20)  # Linear ramp up
+                cls_factor = min(0.2, (epoch - 40) / 20)  # Linear ramp up
                 center_factor = 0.0
             else:
                 # Stage 4: All components with full weight
@@ -1781,20 +1723,16 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
     print("Starting Class-Conditional Diffusion Model training with improved strategies...")
     os.makedirs(save_dir, exist_ok=True)
 
-    autoencoder.eval()  # 設置VAE為評估模式
+    autoencoder.eval()
 
-    # 創建擴散模型
     diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device)
 
-    # 使用AdamW優化器和余弦退火學習率
     optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-5, betas=(0.9, 0.999))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
-    # 訓練循環
     loss_history = []
 
     for epoch in range(num_epochs):
-        # 計算當前殘差縮放因子
         current_res_scale = compute_res_scale(epoch, num_epochs, initial=0.5, final=1.1)
         epoch_loss = 0
 
@@ -1802,12 +1740,10 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
             data = data.to(device)
             labels = labels.to(device)
 
-            # 使用VAE編碼圖像到潛在空間
             with torch.no_grad():
                 mu, logvar = autoencoder.encode_with_params(data)
                 z = autoencoder.reparameterize(mu, logvar)
 
-            # 計算帶有類別條件的擴散損失
             loss = diffusion.loss(z, labels, res_scale=current_res_scale)
 
             # 反向傳播
@@ -1818,17 +1754,13 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
 
             epoch_loss += loss.item()
 
-        # 計算平均損失
         avg_loss = epoch_loss / len(train_loader)
         loss_history.append(avg_loss)
         print(f"Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.6f}")
 
-        # 學習率調度
         scheduler.step()
 
-        # 定期生成和可視化樣本
         if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
-            # 為每個類別生成樣本
             for class_idx in range(len(class_names)):
                 create_diffusion_animation(autoencoder, diffusion, class_idx=class_idx, num_frames=50,
                                            save_path=f"{save_dir}/diffusion_animation_class_{class_names[class_idx]}_epoch_{epoch + 1}.gif")
@@ -1838,10 +1770,8 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
                 save_path = f"{save_dir}/denoising_path_{class_names[class_idx]}_epoch_{epoch + 1}.png"
                 visualize_denoising_steps(autoencoder, diffusion, class_idx=class_idx, save_path=save_path)
 
-            # 保存檢查點
             torch.save(unet.state_dict(), f"{save_dir}/conditional_diffusion_epoch_{epoch + 1}.pt")
 
-    # 保存最終模型
     torch.save(unet.state_dict(), f"{save_dir}/conditional_diffusion_final.pt")
     print(f"Saved final diffusion model after {num_epochs} epochs")
 
@@ -1887,11 +1817,11 @@ def main():
         autoencoder, ae_losses = train_autoencoder(
             autoencoder,
             train_loader,
-            num_epochs=5,
+            num_epochs=1000,
             lr=1e-4,
             lambda_cls=5.0,
             lambda_center=1.0,
-            visualize_every=1,
+            visualize_every=10,
             save_dir=results_dir
         )
 
@@ -1915,9 +1845,9 @@ def main():
 
     # Create conditional UNet with increased dimensions
     conditional_unet = ConditionalUNet(
-        latent_dim=256,  # 增加潛在空間維度
-        hidden_dims=[256, 512, 1024, 512, 256],  # 增加隱藏層維度
-        time_emb_dim=256,  # 增加時間嵌入維度
+        latent_dim=256,
+        hidden_dims=[256, 512, 1024, 512, 256],
+        time_emb_dim=256,
         num_classes=len(class_names)  # 2 classes (cat/dog)
     ).to(device)
 
@@ -1939,8 +1869,8 @@ def main():
 
         # Train conditional diffusion model with improved parameters
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
-            autoencoder, conditional_unet, train_loader, num_epochs=5, lr=5e-4,  # 調整初始學習率
-            visualize_every=1,  # 每10個epoch可視化一次
+            autoencoder, conditional_unet, train_loader, num_epochs=2000, lr=5e-4,
+            visualize_every=10,
             save_dir=results_dir,
             device=device
         )
@@ -1981,7 +1911,7 @@ def main():
     for class_idx in range(len(class_names)):
         animation_path = create_diffusion_animation(
             autoencoder, diffusion, class_idx=class_idx,
-            num_frames=50, fps=15,  # 增加幀率以獲得更平滑的動畫
+            num_frames=50, fps=15,
             save_path=f"{results_dir}/diffusion_animation_{class_names[class_idx]}_final.gif"
         )
         print(f"Created animation for {class_names[class_idx]}: {animation_path}")
