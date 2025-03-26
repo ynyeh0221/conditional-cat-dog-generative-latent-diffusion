@@ -208,22 +208,40 @@ class CenterLoss(nn.Module):
         return total_loss
 
 
+# Custom LayerNorm for 2D convolutional data (CHW format)
+class LayerNorm2d(nn.Module):
+    def __init__(self, num_channels, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
+        self.eps = eps
+
+    def forward(self, x):
+        # x shape: [batch, channels, height, width]
+        mean = x.mean(dim=(2, 3), keepdim=True)
+        var = x.var(dim=(2, 3), keepdim=True, unbiased=False)
+        x = (x - mean) / torch.sqrt(var + self.eps)
+        x = x * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
+        return x
+
+
 # Define Residual Block
+# Updated ResidualBlock with LayerNorm
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
+        self.ln1 = LayerNorm2d(channels)  # Replaced BatchNorm with LayerNorm
         self.swish = Swish()
         self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
+        self.ln2 = LayerNorm2d(channels)  # Replaced BatchNorm with LayerNorm
         self.ca = CALayer(channels)
         self.sa = SpatialAttention()
 
     def forward(self, x):
         residual = x
-        out = self.swish(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = self.swish(self.ln1(self.conv1(x)))
+        out = self.ln2(self.conv2(out))
         out = self.ca(out)
         out = self.sa(out)
         out += residual
@@ -231,15 +249,16 @@ class ResidualBlock(nn.Module):
         return out
 
 
+# Updated Encoder with LayerNorm
 class Encoder(nn.Module):
     def __init__(self, in_channels=3, latent_dim=256):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # 初始卷積層
+        # Initial convolutional layer
         self.initial_conv = nn.Sequential(
             nn.Conv2d(in_channels, 64, 3, padding=1),
-            nn.GroupNorm(8, 64),
+            LayerNorm2d(64),  # Changed from GroupNorm to LayerNorm
             Swish()
         )
 
@@ -247,21 +266,21 @@ class Encoder(nn.Module):
 
         self.down1 = nn.Sequential(
             nn.Conv2d(64, 128, 4, stride=2, padding=1),
-            nn.GroupNorm(16, 128),
+            LayerNorm2d(128),  # Changed from GroupNorm to LayerNorm
             Swish()
         )
         self.res1 = ResidualBlock(128)
 
         self.down2 = nn.Sequential(
             nn.Conv2d(128, 256, 4, stride=2, padding=1),
-            nn.GroupNorm(32, 256),
+            LayerNorm2d(256),  # Changed from GroupNorm to LayerNorm
             Swish()
         )
         self.res2 = ResidualBlock(256)
 
         self.down3 = nn.Sequential(
             nn.Conv2d(256, 512, 4, stride=2, padding=1),
-            nn.GroupNorm(32, 512),
+            LayerNorm2d(512),  # Changed from GroupNorm to LayerNorm
             Swish()
         )
         self.res3 = ResidualBlock(512)
@@ -533,7 +552,6 @@ class Swish(nn.Module):
 
 
 # Time embedding for diffusion model
-# Revised TimeEmbedding for flat latent space
 class TimeEmbedding(nn.Module):
     def __init__(self, n_channels=256):
         super().__init__()
@@ -619,12 +637,13 @@ class UNetAttentionBlock(nn.Module):
 
 
 # Residual block for UNet with class conditioning
+# Updated UNetResidualBlock with LayerNorm
 class UNetResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, d_time=256, num_groups=8, dropout_rate=0.2):
+    def __init__(self, in_channels, out_channels, d_time=256, dropout_rate=0.2):
         super().__init__()
 
         # Feature normalization and convolution
-        self.norm1 = nn.GroupNorm(min(num_groups, in_channels), in_channels)
+        self.norm1 = LayerNorm2d(in_channels)  # Changed from GroupNorm to LayerNorm
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
 
         # Time and class embedding projections
@@ -635,7 +654,7 @@ class UNetResidualBlock(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
 
         # Second convolution
-        self.norm2 = nn.GroupNorm(min(num_groups, out_channels), out_channels)
+        self.norm2 = LayerNorm2d(out_channels)  # Changed from GroupNorm to LayerNorm
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
 
         # Residual connection handling
