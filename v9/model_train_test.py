@@ -1506,7 +1506,7 @@ class VGGPerceptualLoss(nn.Module):
 
 
 def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
-                      lambda_cls=0.5, lambda_center=0.1, lambda_vgg=0.1,
+                      lambda_cls=0.1, lambda_center=0.1, lambda_vgg=0.1,
                       kl_weight_start=0.0001, kl_weight_end=0.01,
                       visualize_every=10, save_dir="./results"):
     """Improved VAE training function with better stability and balanced loss components."""
@@ -1595,7 +1595,7 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
 
             if cls_factor > 0:
                 class_logits = autoencoder.classify(z)
-                class_loss = F.cross_entropy(class_logits, labels)
+                class_loss = euclidean_distance_loss(class_logits, labels)
             else:
                 class_loss = torch.tensor(0.0, device=device)
 
@@ -1717,7 +1717,6 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
     return autoencoder, loss_history
 
 
-# 改進的擴散模型訓練函數
 def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100, lr=1e-3, visualize_every=10,
                                 save_dir="./results", device=None):
     print("Starting Class-Conditional Diffusion Model training with improved strategies...")
@@ -1819,8 +1818,9 @@ def main():
             train_loader,
             num_epochs=1000,
             lr=1e-4,
-            lambda_cls=5.0,
-            lambda_center=1.0,
+            lambda_cls=0.1,
+            lambda_center=0.1,
+            lambda_vgg=0.1,
             visualize_every=10,
             save_dir=results_dir
         )
