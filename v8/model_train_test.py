@@ -67,36 +67,6 @@ def create_cat_dog_dataset(cifar_dataset):
     return CatDogDataset(cifar_dataset, cat_dog_indices)
 
 
-def euclidean_distance_loss(x, y, reduction='mean'):
-    """
-    Calculate the Euclidean distance between x and y tensors.
-
-    Args:
-        x: First tensor
-        y: Second tensor
-        reduction: 'mean', 'sum', or 'none'
-
-    Returns:
-        Euclidean distance loss
-    """
-    # Calculate squared differences
-    squared_diff = (x - y) ** 2
-
-    # Sum across all dimensions except batch
-    squared_dist = squared_diff.view(x.size(0), -1).sum(dim=1)
-
-    # Take square root to get Euclidean distance
-    euclidean_dist = torch.sqrt(squared_dist + 1e-8)  # Add small epsilon to avoid numerical instability
-
-    # Apply reduction
-    if reduction == 'mean':
-        return euclidean_dist.mean()
-    elif reduction == 'sum':
-        return euclidean_dist.sum()
-    else:  # 'none'
-        return euclidean_dist
-
-
 # Channel Attention Layer for improved feature selection
 class CALayer(nn.Module):
     def __init__(self, channel, reduction=16, bias=False):
@@ -251,169 +221,140 @@ class SpatialAttention(nn.Module):
         return x * y
 
 
-# Improved Encoder with skip connections
+# Improved Encoder with appropriate capacity for CIFAR-10
+# Improved Encoder with layer normalization
 class Encoder(nn.Module):
     def __init__(self, in_channels=3, latent_dim=128):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # Initial convolution
-        self.init_conv = nn.Conv2d(in_channels, 16, 3, stride=1, padding=1)
-        self.init_bn = nn.BatchNorm2d(16)
-        self.init_relu = nn.ReLU(inplace=True)
+        # More appropriate layer sizes for CIFAR-10 with layer norm
+        self.conv_layers = nn.Sequential(
+            # First block: 32x32x3 -> 16x16x64
+            nn.Conv2d(in_channels, 64, 4, stride=2, padding=1),
+            nn.GroupNorm(8, 64),  # Group norm with 8 groups
+            nn.LeakyReLU(0.2, inplace=True),
 
-        # First down block
-        self.down1_conv = nn.Conv2d(16, 32, 4, stride=2, padding=1)  # 32x32 -> 16x16
-        self.down1_bn = nn.BatchNorm2d(32)
-        self.down1_relu = nn.ReLU(inplace=True)
-        self.down1_attention = SpatialAttention(32, reduction=8)
+            # Second block: 16x16x64 -> 8x8x128
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
+            nn.GroupNorm(16, 128),  # Group norm with 16 groups
+            nn.LeakyReLU(0.2, inplace=True),
 
-        # First residual block
-        self.res1 = ResidualBlock(32)
+            # Third block: 8x8x128 -> 4x4x256
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),
+            nn.GroupNorm(32, 256),  # Group norm with 32 groups
+            nn.LeakyReLU(0.2, inplace=True),
+        )
 
-        # Second down block
-        self.down2_conv = nn.Conv2d(32, 64, 4, stride=2, padding=1)  # 16x16 -> 8x8
-        self.down2_bn = nn.BatchNorm2d(64)
-        self.down2_relu = nn.ReLU(inplace=True)
-        self.down2_attention = SpatialAttention(64, reduction=8)
+        # 256 channels * 4 * 4 = 4096 flattened features
+        self.flattened_size = 256 * 4 * 4
 
-        # Second residual block
-        self.res2 = ResidualBlock(64)
-
-        # Final processing before latent space
-        self.final_conv = nn.Conv2d(64, 64, 3, stride=1, padding=1)
-        self.final_bn = nn.BatchNorm2d(64)
-        self.final_relu = nn.ReLU(inplace=True)
-
-        # Calculate flattened size: 64 channels * 8 * 8 = 4096
-        self.flattened_size = 64 * 8 * 8
-
-        # Two separate outputs for mean and log variance
+        # Fully connected layers for mean and log variance with layer norm
         self.fc_mu = nn.Sequential(
             nn.Linear(self.flattened_size, 512),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(512),
+            nn.LeakyReLU(0.2),
             nn.Linear(512, latent_dim)
         )
 
         self.fc_logvar = nn.Sequential(
             nn.Linear(self.flattened_size, 512),
-            nn.ReLU(inplace=True),
+            nn.LayerNorm(512),
+            nn.LeakyReLU(0.2),
             nn.Linear(512, latent_dim)
         )
 
-        self.skip_transform1 = nn.Sequential(
-            nn.Conv2d(16, 16, 3, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True)
-        )
-        self.skip_transform2 = nn.Sequential(
-            nn.Conv2d(32, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True)
-        )
-        self.skip_transform3 = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True)
-        )
-
     def forward(self, x):
-        # Remove skip_features list and related code
-        # Initial convolution
-        x = self.init_relu(self.init_bn(self.init_conv(x)))
+        # Pass through convolutional layers
+        x = self.conv_layers(x)
 
-        # First down block
-        x = self.down1_relu(self.down1_bn(self.down1_conv(x)))
-        x = self.down1_attention(x)
-        x = self.res1(x)
+        # Flatten
+        x = x.view(x.size(0), -1)
 
-        # Second down block
-        x = self.down2_relu(self.down2_bn(self.down2_conv(x)))
-        x = self.down2_attention(x)
-        x = self.res2(x)
-
-        # Final processing
-        features = self.final_relu(self.final_bn(self.final_conv(x)))
-
-        # Flatten for latent space projection
-        flattened = features.view(features.size(0), -1)
-
-        # Return just mean and log variance, no skip features
-        mu = self.fc_mu(flattened)
-        logvar = self.fc_logvar(flattened)
+        # Get mean and log variance
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
 
         return mu, logvar
 
 
-# Improved Decoder with skip connections
+# Improved Decoder with layer normalization
 class Decoder(nn.Module):
     def __init__(self, latent_dim=128, out_channels=3):
         super().__init__()
         self.latent_dim = latent_dim
 
-        # Initial fully connected layer from latent space to spatial features
+        # Project from latent space to initial feature volume
         self.fc = nn.Sequential(
             nn.Linear(latent_dim, 512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, 64 * 8 * 8)
+            nn.LayerNorm(512),
+            nn.LeakyReLU(0.2),
+            nn.Linear(512, 256 * 4 * 4),
+            nn.LayerNorm(256 * 4 * 4),
+            nn.LeakyReLU(0.2)
         )
 
-        # Initial convolution after reshape
-        self.init_conv = nn.Conv2d(64, 64, 3, stride=1, padding=1)
-        self.init_bn = nn.BatchNorm2d(64)
-        self.init_relu = nn.ReLU(inplace=True)
-        self.init_attention = SpatialAttention(64, reduction=8)
+        # Transposed convolutions for upsampling with group norm
+        self.deconv_layers = nn.Sequential(
+            # First block: 4x4x256 -> 8x8x128
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),
+            nn.GroupNorm(16, 128),  # Group norm with 16 groups
+            nn.LeakyReLU(0.2, inplace=True),
 
-        # First residual block
-        self.res1 = ResidualBlock(64)
+            # Second block: 8x8x128 -> 16x16x64
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
+            nn.GroupNorm(8, 64),  # Group norm with 8 groups
+            nn.LeakyReLU(0.2, inplace=True),
 
-        # First upsampling: 8x8 -> 16x16
-        self.up1_conv = nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1)
-        self.up1_bn = nn.BatchNorm2d(32)
-        self.up1_relu = nn.ReLU(inplace=True)
-        self.up1_attention = SpatialAttention(32, reduction=8)
+            # Final block: 16x16x64 -> 32x32x3
+            nn.ConvTranspose2d(64, out_channels, 4, stride=2, padding=1),
+            nn.Sigmoid()  # Output in range [0, 1]
+        )
 
-        # Second residual block
-        self.res2 = ResidualBlock(32)
+    def forward(self, z):
+        # Project and reshape
+        x = self.fc(z)
+        x = x.view(-1, 256, 4, 4)
 
-        # Second upsampling: 16x16 -> 32x32
-        self.up2_conv = nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1)
-        self.up2_bn = nn.BatchNorm2d(16)
-        self.up2_relu = nn.ReLU(inplace=True)
-        self.up2_attention = SpatialAttention(16, reduction=8)
-
-        # Final convolution
-        self.final_conv = nn.Conv2d(16, out_channels, 3, padding=1)
-        self.final_act = nn.Sigmoid()  # Output activation for [0,1] range
-
-    def forward(self, z, skip_features=None):
-        # Ignore skip_features parameter completely
-        features = self.fc(z)
-        features = features.view(-1, 64, 8, 8)  # Reshape to [batch_size, 64, 8, 8]
-
-        # Initial convolution
-        x = self.init_relu(self.init_bn(self.init_conv(features)))
-        x = self.init_attention(x)
-        x = self.res1(x)
-
-        # First upsampling
-        x = self.up1_relu(self.up1_bn(self.up1_conv(x)))
-        x = self.up1_attention(x)
-        x = self.res2(x)
-
-        # Second upsampling
-        x = self.up2_relu(self.up2_bn(self.up2_conv(x)))
-        x = self.up2_attention(x)
-
-        # Final convolution to image space
-        x = self.final_act(self.final_conv(x))
-
+        # Decode
+        x = self.deconv_layers(x)
         return x
 
 
-# Enhanced SimpleAutoencoder with the updated encoder and decoder
+# Define Euclidean distance loss
+def euclidean_distance_loss(x, y, reduction='mean'):
+    """
+    Calculate the Euclidean distance between x and y tensors.
+
+    Args:
+        x: First tensor
+        y: Second tensor
+        reduction: 'mean', 'sum', or 'none'
+
+    Returns:
+        Euclidean distance loss
+    """
+    # Calculate squared differences
+    squared_diff = (x - y) ** 2
+
+    # Sum across all dimensions except batch
+    squared_dist = squared_diff.view(x.size(0), -1).sum(dim=1)
+
+    # Take square root to get Euclidean distance
+    euclidean_dist = torch.sqrt(squared_dist + 1e-8)  # Add small epsilon for numerical stability
+
+    # Apply reduction
+    if reduction == 'mean':
+        return euclidean_dist.mean()
+    elif reduction == 'sum':
+        return euclidean_dist.sum()
+    else:  # 'none'
+        return euclidean_dist
+
+
+# Improved SimpleAutoencoder (VAE) with appropriate capacity
 class SimpleAutoencoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=32, num_classes=2, kl_weight=0.01):
+    def __init__(self, in_channels=3, latent_dim=128, num_classes=2, kl_weight=0.0005):
         super().__init__()
         self.latent_dim = latent_dim
         self.kl_weight = kl_weight
@@ -422,80 +363,113 @@ class SimpleAutoencoder(nn.Module):
         self.encoder = Encoder(in_channels, latent_dim)
         self.decoder = Decoder(latent_dim, in_channels)
 
-        # Classifier (temporarily disabled to focus on basic VAE stability)
-        self.classifier = nn.Linear(latent_dim, num_classes)
+        # Classifier with layer norm
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim, 256),
+            nn.LayerNorm(256),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.LayerNorm(128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, num_classes)
+        )
+
+        # For center loss
+        self.register_buffer('class_centers', torch.zeros(num_classes, latent_dim))
+        self.register_buffer('center_counts', torch.zeros(num_classes))
 
         # Initialize weights
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
+            nn.init.kaiming_normal_(m.weight, a=0.2)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d):
+        elif isinstance(m, (nn.LayerNorm, nn.GroupNorm)):
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
 
     def reparameterize(self, mu, logvar):
         """
-        Reparameterization trick to sample from N(mu, var) from N(0,1).
+        Reparameterization trick with numerical stability improvements.
         """
+        # Clamp logvar to prevent numerical issues
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    # Enhanced SimpleAutoencoder with the updated encoder and decoder
     def encode(self, x):
         """Encode input and sample from the latent distribution."""
-        mu, logvar = self.encoder(x)  # No skip features returned
+        mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
         return z
 
     def encode_with_params(self, x):
-        """Encode input and return distribution parameters."""
+        """Return distribution parameters for computing KL divergence loss."""
         return self.encoder(x)
 
     def decode(self, z):
-        """Always ignore skip_features parameter."""
+        """Decode latent vector to reconstruction."""
         return self.decoder(z)
 
     def classify(self, z):
-        """
-        Classify latent vector.
-        """
+        """Classify latent vector."""
         return self.classifier(z)
 
     def compute_center_loss(self, z, labels):
         """
-        Compute center loss for the latent vectors.
+        Simplified and numerically stable center loss computation.
         """
-        return self.center_loss(z, labels)
+        batch_size = z.size(0)
+        centers_batch = self.class_centers[labels]
+
+        # Calculate Euclidean distance for center loss
+        squared_diff = (z - centers_batch) ** 2
+        squared_dist = squared_diff.sum(dim=1)
+        center_loss = torch.sqrt(squared_dist + 1e-8).mean()
+
+        return center_loss
+
+    def update_centers(self, z, labels, momentum=0.9):
+        """
+        Update class centers with moving average for stability.
+        This should be called during training but not included in the loss graph.
+        """
+        unique_labels = torch.unique(labels)
+        for label in unique_labels:
+            mask = (labels == label)
+            if mask.sum() > 0:
+                class_samples = z[mask]
+                class_mean = class_samples.mean(0)
+
+                # Update with momentum
+                old_center = self.class_centers[label]
+                new_center = momentum * old_center + (1 - momentum) * class_mean
+                self.class_centers[label] = new_center
 
     def kl_divergence(self, mu, logvar):
-        """Simple KL divergence with strong clipping for stability"""
-        # Clip values to reasonable ranges
-        mu = torch.clamp(mu, min=-5.0, max=5.0)
-        logvar = torch.clamp(logvar, min=-5.0, max=5.0)
+        """
+        Compute KL divergence with numerical stability improvements.
+        """
+        # Clamp values for stability
+        mu = torch.clamp(mu, min=-10.0, max=10.0)
+        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
 
-        # Standard KL divergence formula
-        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        # KL divergence formula
+        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
 
-        # Clip any extreme values
-        kl = torch.clamp(kl, min=0.0, max=50.0)
-
-        return kl.mean()
+        # Further stability: clip extreme values and take mean
+        kl_loss = torch.clamp(kl_loss, min=0.0, max=100.0).mean()
+        return kl_loss
 
     def forward(self, x):
+        """Complete forward pass."""
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
-
         x_recon = self.decoder(z)
-
         return x_recon, mu, logvar, z
 
 
@@ -906,7 +880,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
         for images, labels in test_loader:
             images = images.to(device)
             # For VAE, use the mean vectors for consistency
-            mu, _, _ = autoencoder.encoder(images)
+            mu, logvar = autoencoder.encode_with_params(images)
             all_latents.append(mu.detach().cpu().numpy())
             all_labels.append(labels.numpy())
 
@@ -935,20 +909,6 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
     samples_per_step = []
     # Track latent path for the first sample
     path_latents = []
-
-    skip_features = None
-    if hasattr(diffusion, 'skip_features_cache') and class_idx in diffusion.skip_features_cache:
-        cached_features = diffusion.skip_features_cache[class_idx]
-        if cached_features:
-            selected_features = []
-            for _ in range(n_samples):
-                idx = np.random.choice(len(cached_features))
-                selected_features.append(cached_features[idx])
-
-            skip_features = []
-            for layer_idx in range(len(selected_features[0])):
-                layer_features = torch.cat([features[layer_idx] for features in selected_features], dim=0)
-                skip_features.append(layer_features)
 
     # ===== PART 3: Perform denoising and track path =====
     with torch.no_grad():
@@ -1147,7 +1107,7 @@ def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
     with torch.no_grad():
         # Get reconstruction with VAE forward pass
         # Forward pass using the updated autoencoder architecture
-        mu, logvar, skip_features = autoencoder.encode_with_params(test_images)
+        mu, logvar = autoencoder.encode_with_params(test_images)
         z = autoencoder.reparameterize(mu, logvar)
         reconstructed = autoencoder.decode(z)
 
@@ -1194,7 +1154,7 @@ def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
             images = images.to(device)
             # For VAE, we want the mean vectors for consistency
             # Unpack the three returned values properly
-            mu, logvar, _ = autoencoder.encode_with_params(images)
+            mu, logvar = autoencoder.encode_with_params(images)
             all_latents.append(mu.cpu().numpy())
             all_labels.append(labels.numpy())
 
@@ -1440,8 +1400,8 @@ def compute_res_scale(epoch, total_epochs, initial=5.0, final=1.0):
     # Linear decay: at epoch 0, returns initial; at final epoch, returns final.
     if epoch <= 20:
         return 0.1
-    progress = max(0, min(1, (epoch - 20) / (total_epochs - 20)))
-    return initial + (final - initial) * (1 - epoch / total_epochs)
+    return initial + (final - initial) * (epoch / total_epochs)
+
 
 # Main function
 def main():
@@ -1479,17 +1439,27 @@ def main():
         print("No existing autoencoder found. Training a new one...")
 
         # Updated training function for the VAE
-        def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-6, lambda_cls=5.0,
-                              lambda_center=2.0, kl_weight=0.01, visualize_every=1, save_dir="./results"):
-            """Simplified training function that maintains compatibility with main()"""
-            print("Starting VAE training with focus on stability...")
+        def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=3e-4,
+                              lambda_cls=0.1, lambda_center=0.05,
+                              kl_weight_start=0.001, kl_weight_end=0.02,
+                              visualize_every=10, save_dir="./results"):
+            """Improved VAE training function with better stability."""
+            print("Starting VAE training with improved stability...")
             os.makedirs(save_dir, exist_ok=True)
             device = next(autoencoder.parameters()).device
 
-            # Single optimizer with extremely low learning rate
-            optimizer = optim.Adam(autoencoder.parameters(), lr=lr)
+            # Adam optimizer with conservative settings
+            optimizer = optim.Adam(autoencoder.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=1e-6)
+
+            # Learning rate scheduler for stability
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.7, patience=5, verbose=True, min_lr=1e-6
+            )
 
             loss_history = {'total': [], 'recon': [], 'kl': [], 'class': [], 'center': []}
+
+            # Initialize best loss for model saving
+            best_loss = float('inf')
 
             for epoch in range(num_epochs):
                 autoencoder.train()
@@ -1499,121 +1469,139 @@ def main():
                 epoch_center_loss = 0
                 epoch_total_loss = 0
 
-                print(f"Epoch {epoch + 1}/{num_epochs}")
+                # Gradually increase KL weight using a schedule
+                if epoch < num_epochs // 3:
+                    # Warm up phase - very small KL weight
+                    kl_weight = kl_weight_start
+                else:
+                    # Linear annealing to final value
+                    progress = (epoch - num_epochs // 3) / (num_epochs * 2 // 3)
+                    kl_weight = kl_weight_start + progress * (kl_weight_end - kl_weight_start)
+                    kl_weight = min(kl_weight, kl_weight_end)  # Ensure we don't exceed end value
+
+                autoencoder.kl_weight = kl_weight  # Update model's KL weight
+
+                print(f"Epoch {epoch + 1}/{num_epochs} - KL Weight: {kl_weight:.6f}")
 
                 for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Training")):
                     data = data.to(device)
                     labels = labels.to(device)
 
-                    # Basic VAE steps
+                    # Forward pass
                     optimizer.zero_grad()
+                    recon_x, mu, logvar, z = autoencoder(data)
 
-                    # Encoder forward pass
-                    mu, logvar = autoencoder.encode_with_params(data)
-
-                    # Reparameterization
-                    z = autoencoder.reparameterize(mu, logvar)
-
-                    reconstructed = autoencoder.decode(z)
-
-                    # Basic losses only for first 10 epochs
-                    recon_loss = euclidean_distance_loss(reconstructed, data)
-
-                    # Clip mu and logvar for KL calculation
-                    mu_clipped = torch.clamp(mu, min=-5.0, max=5.0)
-                    logvar_clipped = torch.clamp(logvar, min=-5.0, max=5.0)
-                    kl_loss = -0.5 * torch.sum(1 + logvar_clipped - mu_clipped.pow(2) - logvar_clipped.exp(),
-                                               dim=1).mean()
-
-                    # Start with very low KL weight and increase it slowly
-                    current_kl_weight = kl_weight * min(1.0, epoch / 20)
-
-                    # Only add classification after basic VAE is stable
-                    if epoch < 10:
-                        # Skip classification and center loss for first few epochs
+                    # Multi-phase training strategy
+                    if epoch < 5:
+                        # Phase 1: Only reconstruction loss - stabilize decoder
+                        recon_loss = euclidean_distance_loss(recon_x, data)
+                        kl_loss = torch.tensor(0.0, device=device)
                         class_loss = torch.tensor(0.0, device=device)
                         center_loss = torch.tensor(0.0, device=device)
-                        total_loss = recon_loss + current_kl_weight * kl_loss
-                    else:
-                        # Add classification with lowered weight
+                        total_loss = recon_loss
+
+                    elif epoch < 10:
+                        # Phase 2: Add small KL - start learning distribution
+                        recon_loss = euclidean_distance_loss(recon_x, data)
+                        kl_loss = autoencoder.kl_divergence(mu, logvar)
+                        class_loss = torch.tensor(0.0, device=device)
+                        center_loss = torch.tensor(0.0, device=device)
+                        total_loss = recon_loss + kl_weight * kl_loss
+
+                    elif epoch < 20:
+                        # Phase 3: Add classification
+                        recon_loss = euclidean_distance_loss(recon_x, data)
+                        kl_loss = autoencoder.kl_divergence(mu, logvar)
                         class_logits = autoencoder.classify(z)
                         class_loss = F.cross_entropy(class_logits, labels)
+                        center_loss = torch.tensor(0.0, device=device)
+                        total_loss = recon_loss + kl_weight * kl_loss + lambda_cls * class_loss
 
-                        # IMPORTANT: Replace the problematic center_loss with a simple L2 distance
-                        # This avoids the numerical instability in your original CenterLoss implementation
-                        if epoch < 20:
-                            # Skip center loss completely for a while
-                            center_loss = torch.tensor(0.0, device=device)
-                        else:
-                            # Very simplified center loss calculation
-                            centers = torch.zeros(2, z.size(1), device=device)  # 2 classes
-                            # Compute class centers
-                            for c in range(2):
-                                mask = (labels == c)
-                                if mask.sum() > 0:
-                                    centers[c] = z[mask].mean(dim=0)
-                            # Compute distance to centers
-                            class_centers = centers[labels]
-                            center_loss = torch.mean((z - class_centers).pow(2).sum(dim=1))
-                            # Use a much smaller weight for center loss
-                            lambda_center = lambda_center * 0.01
-
-                        # Full loss with carefully scaled components
-                        total_loss = recon_loss + current_kl_weight * kl_loss + \
-                                     lambda_cls * 0.1 * class_loss + \
-                                     lambda_center * center_loss
+                    else:
+                        # Phase 4: Full training with all components
+                        recon_loss = euclidean_distance_loss(recon_x, data)
+                        kl_loss = autoencoder.kl_divergence(mu, logvar)
+                        class_logits = autoencoder.classify(z)
+                        class_loss = F.cross_entropy(class_logits, labels)
+                        center_loss = autoencoder.compute_center_loss(z, labels)
+                        total_loss = recon_loss + kl_weight * kl_loss + lambda_cls * class_loss + lambda_center * center_loss
 
                     # Skip problematic batches
                     if torch.isnan(total_loss) or torch.isinf(total_loss):
-                        print(f"Skipping batch {batch_idx} - invalid loss value")
+                        print(f"WARNING: Invalid loss detected in batch {batch_idx}. Skipping.")
                         continue
 
-                    # Backward and optimize with tight gradient clipping
+                    # Backward pass with gradient clipping
                     total_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=0.1)
+                    torch.nn.utils.clip_grad_norm_(autoencoder.parameters(), max_norm=1.0)
                     optimizer.step()
 
-                    # Safe recording of losses
+                    # Update centers (detached from computational graph)
+                    with torch.no_grad():
+                        if epoch >= 20:
+                            autoencoder.update_centers(z.detach(), labels, momentum=0.9)
+
+                    # Log losses
                     epoch_recon_loss += recon_loss.item()
-                    epoch_kl_loss += kl_loss.item()
+                    epoch_kl_loss += kl_loss.item() if isinstance(kl_loss, torch.Tensor) else 0
                     epoch_class_loss += class_loss.item() if isinstance(class_loss, torch.Tensor) else 0
                     epoch_center_loss += center_loss.item() if isinstance(center_loss, torch.Tensor) else 0
                     epoch_total_loss += total_loss.item()
 
-                # Average losses
+                # Calculate average losses
                 num_batches = len(train_loader)
-                epoch_losses = {
-                    'recon': epoch_recon_loss / num_batches,
-                    'kl': epoch_kl_loss / num_batches,
-                    'class': epoch_class_loss / num_batches,
-                    'center': epoch_center_loss / num_batches,
-                    'total': epoch_total_loss / num_batches
-                }
+                avg_recon_loss = epoch_recon_loss / num_batches
+                avg_kl_loss = epoch_kl_loss / num_batches
+                avg_class_loss = epoch_class_loss / num_batches
+                avg_center_loss = epoch_center_loss / num_batches
+                avg_total_loss = epoch_total_loss / num_batches
 
-                # Store in history
-                for k, v in epoch_losses.items():
-                    loss_history[k].append(v)
+                # Store losses in history
+                loss_history['recon'].append(avg_recon_loss)
+                loss_history['kl'].append(avg_kl_loss)
+                loss_history['class'].append(avg_class_loss)
+                loss_history['center'].append(avg_center_loss)
+                loss_history['total'].append(avg_total_loss)
 
+                # Print epoch summary
                 print(f"Epoch {epoch + 1}/{num_epochs}, "
-                      f"Total Loss: {epoch_losses['total']:.6f}, "
-                      f"Recon Loss: {epoch_losses['recon']:.6f}, "
-                      f"KL Loss: {epoch_losses['kl']:.6f}, "
-                      f"Class Loss: {epoch_losses['class']:.6f}, "
-                      f"Center Loss: {epoch_losses['center']:.6f}")
+                      f"Total Loss: {avg_total_loss:.6f}, "
+                      f"Recon Loss: {avg_recon_loss:.6f}, "
+                      f"KL Loss: {avg_kl_loss:.6f}, "
+                      f"Class Loss: {avg_class_loss:.6f}, "
+                      f"Center Loss: {avg_center_loss:.6f}")
 
-                # Visualizations and checkpoints
+                # Update learning rate based on total loss
+                scheduler.step(avg_total_loss)
+
+                # Save best model
+                if avg_total_loss < best_loss:
+                    best_loss = avg_total_loss
+                    torch.save(autoencoder.state_dict(), f"{save_dir}/vae_best.pt")
+                    print(f"Saved best model with loss: {best_loss:.6f}")
+
+                # Visualizations and regular checkpoints
                 if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
                     visualize_reconstructions(autoencoder, epoch + 1, save_dir)
                     visualize_latent_space(autoencoder, epoch + 1, save_dir)
                     torch.save(autoencoder.state_dict(), f"{save_dir}/vae_epoch_{epoch + 1}.pt")
+
+                # Early stopping check (optional)
+                if optimizer.param_groups[0]['lr'] <= 1e-6 and epoch > num_epochs // 2:
+                    print(f"Learning rate too small, stopping training at epoch {epoch + 1}")
+                    break
+
+            # Save final model
+            torch.save(autoencoder.state_dict(), f"{save_dir}/vae_final.pt")
+            print(f"Saved final model after {num_epochs} epochs")
 
             return autoencoder, loss_history
 
         # Train autoencoder
         autoencoder, ae_losses = train_autoencoder(
             autoencoder,
-            train_loader,  # Add this parameter
-            num_epochs=600,
+            train_loader,
+            num_epochs=1000,
             lr=1e-4,
             lambda_cls=5.0,
             lambda_center=1.0,
@@ -1691,7 +1679,7 @@ def main():
 
                     # Encode images to latent space using VAE
                     with torch.no_grad():
-                        mu, logvar, skip_features = autoencoder.encode_with_params(data)
+                        mu, logvar = autoencoder.encode_with_params(data)
                         z = autoencoder.reparameterize(mu, logvar)
 
                     # Calculate diffusion loss with class conditioning
