@@ -301,25 +301,36 @@ class Encoder(nn.Module):
             nn.Linear(512, latent_dim)
         )
 
-    def forward(self, x):
-        # Store intermediate features for skip connections
-        skip_features = []
+        self.skip_transform1 = nn.Sequential(
+            nn.Conv2d(16, 16, 3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
+        )
+        self.skip_transform2 = nn.Sequential(
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True)
+        )
+        self.skip_transform3 = nn.Sequential(
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
 
+    def forward(self, x):
+        # Remove skip_features list and related code
         # Initial convolution
         x = self.init_relu(self.init_bn(self.init_conv(x)))
-        skip_features.append(x)  # 32x32x16
 
         # First down block
         x = self.down1_relu(self.down1_bn(self.down1_conv(x)))
         x = self.down1_attention(x)
         x = self.res1(x)
-        skip_features.append(x)  # 16x16x32
 
         # Second down block
         x = self.down2_relu(self.down2_bn(self.down2_conv(x)))
         x = self.down2_attention(x)
         x = self.res2(x)
-        skip_features.append(x)  # 8x8x64
 
         # Final processing
         features = self.final_relu(self.final_bn(self.final_conv(x)))
@@ -327,11 +338,11 @@ class Encoder(nn.Module):
         # Flatten for latent space projection
         flattened = features.view(features.size(0), -1)
 
-        # Return both mean and log variance along with skip features
+        # Return just mean and log variance, no skip features
         mu = self.fc_mu(flattened)
         logvar = self.fc_logvar(flattened)
 
-        return mu, logvar, skip_features
+        return mu, logvar
 
 
 # Improved Decoder with skip connections
@@ -376,37 +387,23 @@ class Decoder(nn.Module):
         self.final_act = nn.Sigmoid()  # Output activation for [0,1] range
 
     def forward(self, z, skip_features=None):
-        # z is [batch_size, latent_dim]
+        # Ignore skip_features parameter completely
         features = self.fc(z)
         features = features.view(-1, 64, 8, 8)  # Reshape to [batch_size, 64, 8, 8]
 
         # Initial convolution
         x = self.init_relu(self.init_bn(self.init_conv(features)))
         x = self.init_attention(x)
-
-        # Add skip connection if available
-        if skip_features is not None:
-            x = x + skip_features[2]  # 8x8x64
-
         x = self.res1(x)
 
         # First upsampling
         x = self.up1_relu(self.up1_bn(self.up1_conv(x)))
         x = self.up1_attention(x)
-
-        # Add skip connection if available
-        if skip_features is not None:
-            x = x + skip_features[1]  # 16x16x32
-
         x = self.res2(x)
 
         # Second upsampling
         x = self.up2_relu(self.up2_bn(self.up2_conv(x)))
         x = self.up2_attention(x)
-
-        # Add skip connection if available
-        if skip_features is not None:
-            x = x + skip_features[0]  # 32x32x16
 
         # Final convolution to image space
         x = self.final_act(self.final_conv(x))
@@ -414,28 +411,8 @@ class Decoder(nn.Module):
         return x
 
 
-# Define Residual Block
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
-
-    def forward(self, x):
-        residual = x
-        out = self.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += residual
-        out = self.relu(out)
-        return out
-
-
 # Enhanced SimpleAutoencoder with the updated encoder and decoder
 class SimpleAutoencoder(nn.Module):
-    # Modify SimpleAutoencoder initialization
     def __init__(self, in_channels=3, latent_dim=32, num_classes=2, kl_weight=0.01):
         super().__init__()
         self.latent_dim = latent_dim
@@ -472,27 +449,20 @@ class SimpleAutoencoder(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
+    # Enhanced SimpleAutoencoder with the updated encoder and decoder
     def encode(self, x):
-        """
-        Encode input and sample from the latent distribution.
-        Returns the sampled latent vector z and skip features.
-        """
-        mu, logvar, skip_features = self.encoder(x)
+        """Encode input and sample from the latent distribution."""
+        mu, logvar = self.encoder(x)  # No skip features returned
         z = self.reparameterize(mu, logvar)
-        return z, skip_features
+        return z
 
     def encode_with_params(self, x):
-        """
-        Encode input and return distribution parameters and skip features.
-        This is useful for computing the KL divergence loss.
-        """
+        """Encode input and return distribution parameters."""
         return self.encoder(x)
 
-    def decode(self, z, skip_features=None):
-        """
-        Decode latent vector to reconstruction, with optional skip features.
-        """
-        return self.decoder(z, skip_features)
+    def decode(self, z):
+        """Always ignore skip_features parameter."""
+        return self.decoder(z)
 
     def classify(self, z):
         """
@@ -506,7 +476,6 @@ class SimpleAutoencoder(nn.Module):
         """
         return self.center_loss(z, labels)
 
-    # 1. Simplify kl_divergence - no target approach, just basic calculation with clipping
     def kl_divergence(self, mu, logvar):
         """Simple KL divergence with strong clipping for stability"""
         # Clip values to reasonable ranges
@@ -522,10 +491,11 @@ class SimpleAutoencoder(nn.Module):
         return kl.mean()
 
     def forward(self, x):
-        mu, logvar, skip_features = self.encoder(x)
+        mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
-        # Pass None instead of skip_features
-        x_recon = self.decoder(z, None)
+
+        x_recon = self.decoder(z)
+
         return x_recon, mu, logvar, z
 
 
@@ -541,9 +511,9 @@ class TimeEmbedding(nn.Module):
     def __init__(self, n_channels=128):
         super().__init__()
         self.n_channels = n_channels
-        self.lin1 = nn.Linear(self.n_channels, self.n_channels)
+        self.lin1 = nn.Linear(self.n_channels, self.n_channels * 2)
         self.act = Swish()
-        self.lin2 = nn.Linear(self.n_channels, self.n_channels)
+        self.lin2 = nn.Linear(self.n_channels * 2, self.n_channels)
 
     def forward(self, t):
         # Sinusoidal time embedding similar to positional encoding
@@ -966,6 +936,20 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
     # Track latent path for the first sample
     path_latents = []
 
+    skip_features = None
+    if hasattr(diffusion, 'skip_features_cache') and class_idx in diffusion.skip_features_cache:
+        cached_features = diffusion.skip_features_cache[class_idx]
+        if cached_features:
+            selected_features = []
+            for _ in range(n_samples):
+                idx = np.random.choice(len(cached_features))
+                selected_features.append(cached_features[idx])
+
+            skip_features = []
+            for layer_idx in range(len(selected_features[0])):
+                layer_features = torch.cat([features[layer_idx] for features in selected_features], dim=0)
+                skip_features.append(layer_features)
+
     # ===== PART 3: Perform denoising and track path =====
     with torch.no_grad():
         for t in timesteps:
@@ -1165,7 +1149,7 @@ def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
         # Forward pass using the updated autoencoder architecture
         mu, logvar, skip_features = autoencoder.encode_with_params(test_images)
         z = autoencoder.reparameterize(mu, logvar)
-        reconstructed = autoencoder.decode(z, skip_features)
+        reconstructed = autoencoder.decode(z)
 
     # Create visualization
     fig, axes = plt.subplots(2, 8, figsize=(16, 4))
@@ -1454,9 +1438,10 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
 
 def compute_res_scale(epoch, total_epochs, initial=5.0, final=1.0):
     # Linear decay: at epoch 0, returns initial; at final epoch, returns final.
-    if epoch < 20:
-        return 0
-    return initial + (final - initial) * max(0, 1 - epoch / total_epochs)
+    if epoch <= 20:
+        return 0.1
+    progress = max(0, min(1, (epoch - 20) / (total_epochs - 20)))
+    return initial + (final - initial) * (1 - epoch / total_epochs)
 
 # Main function
 def main():
@@ -1469,7 +1454,7 @@ def main():
     print(f"Using device: {device}")
 
     # Create results directory
-    results_dir = "./cifar_cat_dog_conditional_v6_2"
+    results_dir = "./cifar_cat_dog_conditional_v6_3"
     os.makedirs(results_dir, exist_ok=True)
 
     # Load CIFAR-10 dataset and filter for cats and dogs
@@ -1488,7 +1473,7 @@ def main():
     # Check if trained autoencoder exists
     if os.path.exists(autoencoder_path):
         print(f"Loading existing autoencoder from {autoencoder_path}")
-        autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device))
+        autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device), strict=False)
         autoencoder.eval()
     else:
         print("No existing autoencoder found. Training a new one...")
@@ -1524,17 +1509,12 @@ def main():
                     optimizer.zero_grad()
 
                     # Encoder forward pass
-                    mu, logvar, skip_features = autoencoder.encode_with_params(data)
+                    mu, logvar = autoencoder.encode_with_params(data)
 
                     # Reparameterization
                     z = autoencoder.reparameterize(mu, logvar)
 
-                    # Phase 1: No skip connections (first 20 epochs)
-                    if epoch < 20:
-                        reconstructed = autoencoder.decode(z, None)
-                    else:
-                        # Phase 2: With skip connections (after epoch 20)
-                        reconstructed = autoencoder.decode(z, skip_features)
+                    reconstructed = autoencoder.decode(z)
 
                     # Basic losses only for first 10 epochs
                     recon_loss = euclidean_distance_loss(reconstructed, data)
@@ -1636,7 +1616,7 @@ def main():
             num_epochs=600,
             lr=1e-4,
             lambda_cls=5.0,
-            lambda_center=2.0,
+            lambda_center=1.0,
             visualize_every=10,
             save_dir=results_dir
         )
@@ -1692,7 +1672,7 @@ def main():
 
             # Create diffusion model
             diffusion = ConditionalDenoiseDiffusion(unet, n_steps=1000, device=device)
-            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-4)
+            optimizer = torch.optim.AdamW(unet.parameters(), lr=lr, weight_decay=1e-5)
             # T_0: number of iterations (or epochs) before the first restart.
             # T_mult: factor by which the period increases after each restart.
             scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
@@ -1702,7 +1682,7 @@ def main():
 
             for epoch in range(num_epochs):
                 # Compute the current residual scaling factor
-                current_res_scale = compute_res_scale(epoch, num_epochs, initial=0.5, final=1)
+                current_res_scale = compute_res_scale(epoch, num_epochs, initial=0.5, final=1.1)
                 epoch_loss = 0
 
                 for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")):
@@ -1711,11 +1691,11 @@ def main():
 
                     # Encode images to latent space using VAE
                     with torch.no_grad():
-                        # Use the sample from encoding function
-                        latents, _ = autoencoder.encode(data)
+                        mu, logvar, skip_features = autoencoder.encode_with_params(data)
+                        z = autoencoder.reparameterize(mu, logvar)
 
                     # Calculate diffusion loss with class conditioning
-                    loss = diffusion.loss(latents, labels, res_scale=current_res_scale)
+                    loss = diffusion.loss(z, labels, res_scale=current_res_scale)
 
                     # Backward pass
                     optimizer.zero_grad()
