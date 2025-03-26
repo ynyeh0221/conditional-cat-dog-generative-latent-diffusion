@@ -383,7 +383,9 @@ class SimpleAutoencoder(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
-        if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
+        # Use proper initialization for all layers
+        if isinstance(m, nn.Linear):
+            # Use Kaiming initialization for all linear layers
             nn.init.kaiming_normal_(m.weight, a=0.2)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -396,7 +398,7 @@ class SimpleAutoencoder(nn.Module):
         Reparameterization trick with numerical stability improvements.
         """
         # Clamp logvar to prevent numerical issues
-        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        logvar = torch.clamp(logvar, min=-2.0, max=10.0)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
@@ -409,7 +411,10 @@ class SimpleAutoencoder(nn.Module):
 
     def encode_with_params(self, x):
         """Return distribution parameters for computing KL divergence loss."""
-        return self.encoder(x)
+        mu, logvar = self.encoder(x)
+        # Add stronger clamping here as well
+        logvar = torch.clamp(logvar, min=-2.0, max=10.0)
+        return mu, logvar
 
     def decode(self, z):
         """Decode latent vector to reconstruction."""
@@ -423,7 +428,6 @@ class SimpleAutoencoder(nn.Module):
         """
         Simplified and numerically stable center loss computation.
         """
-        batch_size = z.size(0)
         centers_batch = self.class_centers[labels]
 
         # Calculate Euclidean distance for center loss
@@ -454,16 +458,20 @@ class SimpleAutoencoder(nn.Module):
         """
         Compute KL divergence with numerical stability improvements.
         """
+        if torch.isnan(mu).any() or torch.isnan(logvar).any():
+            print("NaN detected in mu or logvar!")
+
         # Clamp values for stability
         mu = torch.clamp(mu, min=-10.0, max=10.0)
-        logvar = torch.clamp(logvar, min=-10.0, max=10.0)
+        logvar = torch.clamp(logvar, min=-2.0, max=10.0)
 
         # KL divergence formula
         kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
 
         # Further stability: clip extreme values and take mean
         kl_loss = torch.clamp(kl_loss, min=0.0, max=100.0).mean()
-        return kl_loss
+        mu_reg = 1e-4 * torch.sum(mu.pow(2))  # L2 regularization on mu
+        return kl_loss + mu_reg
 
     def forward(self, x):
         """Complete forward pass."""
@@ -1403,6 +1411,16 @@ def compute_res_scale(epoch, total_epochs, initial=5.0, final=1.0):
     return initial + (final - initial) * (epoch / total_epochs)
 
 
+def cyclical_annealing(epoch, cycle_length, kl_weight_start, kl_weight_end):
+    cycle_position = (epoch % cycle_length) / cycle_length
+
+    if cycle_position < 0.5:
+        weight = kl_weight_start + (kl_weight_end - kl_weight_start) * (2.0 * cycle_position)
+    else:
+        weight = kl_weight_end
+
+    return weight
+
 # Main function
 def main():
     """Main function to run the entire pipeline non-interactively"""
@@ -1439,9 +1457,9 @@ def main():
         print("No existing autoencoder found. Training a new one...")
 
         # Updated training function for the VAE
-        def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=3e-4,
+        def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
                               lambda_cls=0.1, lambda_center=0.05,
-                              kl_weight_start=0.001, kl_weight_end=0.02,
+                              kl_weight_start=0.0001, kl_weight_end=0.05,
                               visualize_every=10, save_dir="./results"):
             """Improved VAE training function with better stability."""
             print("Starting VAE training with improved stability...")
@@ -1469,17 +1487,9 @@ def main():
                 epoch_center_loss = 0
                 epoch_total_loss = 0
 
-                # Gradually increase KL weight using a schedule
-                if epoch < num_epochs // 3:
-                    # Warm up phase - very small KL weight
-                    kl_weight = kl_weight_start
-                else:
-                    # Linear annealing to final value
-                    progress = (epoch - num_epochs // 3) / (num_epochs * 2 // 3)
-                    kl_weight = kl_weight_start + progress * (kl_weight_end - kl_weight_start)
-                    kl_weight = min(kl_weight, kl_weight_end)  # Ensure we don't exceed end value
-
-                autoencoder.kl_weight = kl_weight  # Update model's KL weight
+                # Apply a simple linear annealing schedule
+                kl_weight = min(kl_weight_end, kl_weight_start + (epoch / 100) * (kl_weight_end - kl_weight_start))
+                autoencoder.kl_weight = kl_weight
 
                 print(f"Epoch {epoch + 1}/{num_epochs} - KL Weight: {kl_weight:.6f}")
 
@@ -1492,7 +1502,7 @@ def main():
                     recon_x, mu, logvar, z = autoencoder(data)
 
                     # Multi-phase training strategy
-                    if epoch < 5:
+                    if epoch < 20:
                         # Phase 1: Only reconstruction loss - stabilize decoder
                         recon_loss = euclidean_distance_loss(recon_x, data)
                         kl_loss = torch.tensor(0.0, device=device)
@@ -1500,7 +1510,7 @@ def main():
                         center_loss = torch.tensor(0.0, device=device)
                         total_loss = recon_loss
 
-                    elif epoch < 10:
+                    elif epoch < 40:
                         # Phase 2: Add small KL - start learning distribution
                         recon_loss = euclidean_distance_loss(recon_x, data)
                         kl_loss = autoencoder.kl_divergence(mu, logvar)
@@ -1508,7 +1518,7 @@ def main():
                         center_loss = torch.tensor(0.0, device=device)
                         total_loss = recon_loss + kl_weight * kl_loss
 
-                    elif epoch < 20:
+                    elif epoch < 60:
                         # Phase 3: Add classification
                         recon_loss = euclidean_distance_loss(recon_x, data)
                         kl_loss = autoencoder.kl_divergence(mu, logvar)
