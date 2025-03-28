@@ -420,7 +420,7 @@ def euclidean_distance_loss(x, y, reduction='mean'):
 
 
 class SimpleAutoencoder(nn.Module):
-    def __init__(self, in_channels=3, latent_dim=256, num_classes=2, kl_weight=0.0005):  # 增加潛在空間維度
+    def __init__(self, in_channels=3, latent_dim=256, num_classes=2, kl_weight=0.0005):
         super().__init__()
         self.latent_dim = latent_dim
         self.kl_weight = kl_weight
@@ -432,7 +432,7 @@ class SimpleAutoencoder(nn.Module):
             nn.Linear(latent_dim, 512),
             nn.LayerNorm(512),
             Swish(),
-            nn.Dropout(0.3),  # 增加Dropout率
+            nn.Dropout(0.3),
             nn.Linear(512, 256),
             nn.LayerNorm(256),
             Swish(),
