@@ -1764,7 +1764,6 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
 
             loss = diffusion.loss(z, labels, res_scale=current_res_scale)
 
-            # 反向傳播
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(unet.parameters(), max_norm=1.0)
