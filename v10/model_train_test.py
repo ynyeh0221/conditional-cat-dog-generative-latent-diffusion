@@ -980,7 +980,7 @@ class Discriminator64(nn.Module):
             nn.Conv2d(256, 512, 4, stride=2, padding=1),  # 4x4 -> 2x2 (if applicable)
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1, 4),  # output single value
+            nn.Conv2d(512, 1, 2),  # output single value
             nn.Sigmoid()
         )
 
@@ -1264,7 +1264,7 @@ def main(checkpoint_path=None, total_epochs=2000):
             lambda_cls=0.3,
             lambda_center=0.1,
             lambda_vgg=0.4,
-            visualize_every=50,
+            visualize_every=1,
             save_dir=results_dir
         )
         torch.save(autoencoder.state_dict(), autoencoder_path)
@@ -1376,4 +1376,3 @@ def main(checkpoint_path=None, total_epochs=2000):
 
 if __name__ == "__main__":
     main(total_epochs=10000)
-
