@@ -39,6 +39,7 @@ batch_size = 64  # adjust based on available GPU memory
 # For CIFAR-10 cat/dog, we have 2 classes.
 class_names = ["cat", "dog"]
 
+
 # -----------------------------
 # Custom dataset: CIFAR10CatDog
 # -----------------------------
@@ -54,12 +55,14 @@ class CIFAR10CatDog(datasets.CIFAR10):
         # Remap: cat (3) -> 0, dog (5) -> 1
         self.targets = [0 if t == 3 else 1 for t in self.targets]
 
+
 # -----------------------------
 # Model definitions (unchanged except num_classes set to 2)
 # -----------------------------
 class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
+
 
 class CALayer(nn.Module):
     def __init__(self, channel, reduction=8):
@@ -77,6 +80,7 @@ class CALayer(nn.Module):
         y = self.conv_du(y)
         return x * y
 
+
 class SpatialAttention(nn.Module):
     def __init__(self, kernel_size=7):
         super(SpatialAttention, self).__init__()
@@ -90,6 +94,7 @@ class SpatialAttention(nn.Module):
         attention = self.conv(attention)
         attention = self.sigmoid(attention)
         return x * attention
+
 
 class CenterLoss(nn.Module):
     def __init__(self, num_classes=2, feat_dim=256, min_distance=1.0, repulsion_strength=1.0):
@@ -143,12 +148,15 @@ class CenterLoss(nn.Module):
             intra_class_variance = intra_class_variance / self.num_classes
         total_loss = attraction_loss + self.repulsion_strength * repulsion_loss - 0.1 * intra_class_variance
         with torch.no_grad():
-            self.avg_center_dist = torch.sum(center_distances * diff_mask) / (self.num_classes * (self.num_classes - 1) + 1e-6)
+            self.avg_center_dist = torch.sum(center_distances * diff_mask) / (
+                        self.num_classes * (self.num_classes - 1) + 1e-6)
             self.avg_sample_dist = torch.mean(distmat)
             self.center_attraction = attraction_loss.item()
             self.center_repulsion = repulsion_loss.item()
-            self.intra_variance = intra_class_variance.item() if isinstance(intra_class_variance, torch.Tensor) else intra_class_variance
+            self.intra_variance = intra_class_variance.item() if isinstance(intra_class_variance,
+                                                                            torch.Tensor) else intra_class_variance
         return total_loss
+
 
 class LayerNorm2d(nn.Module):
     def __init__(self, num_channels, eps=1e-5):
@@ -163,6 +171,7 @@ class LayerNorm2d(nn.Module):
         x = (x - mean) / torch.sqrt(var + self.eps)
         x = x * self.weight.view(1, -1, 1, 1) + self.bias.view(1, -1, 1, 1)
         return x
+
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -184,6 +193,7 @@ class ResidualBlock(nn.Module):
         out += residual
         out = self.swish(out)
         return out
+
 
 class Encoder(nn.Module):
     def __init__(self, in_channels=3, latent_dim=256):
@@ -245,6 +255,7 @@ class Encoder(nn.Module):
         logvar = self.fc_logvar(x_flat)
         return mu, logvar
 
+
 class Decoder(nn.Module):
     def __init__(self, latent_dim=256, out_channels=3):
         super().__init__()
@@ -295,6 +306,7 @@ class Decoder(nn.Module):
         x = self.final_conv(x)
         return x
 
+
 def euclidean_distance_loss(x, y, reduction='mean'):
     squared_diff = (x - y) ** 2
     squared_dist = squared_diff.view(x.size(0), -1).sum(dim=1)
@@ -305,6 +317,7 @@ def euclidean_distance_loss(x, y, reduction='mean'):
         return euclidean_dist.sum()
     else:
         return euclidean_dist
+
 
 class SimpleAutoencoder(nn.Module):
     def __init__(self, in_channels=3, latent_dim=256, num_classes=2):
@@ -396,10 +409,12 @@ class SimpleAutoencoder(nn.Module):
         x_recon = self.decoder(z, self.encoder.skip_features)
         return x_recon, mu, logvar, z
 
+
 # Swish activation (if needed later)
 class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
+
 
 class TimeEmbedding(nn.Module):
     def __init__(self, n_channels=256):
@@ -420,6 +435,7 @@ class TimeEmbedding(nn.Module):
             emb = torch.cat([emb, padding], dim=1)
         return self.lin2(self.act(self.lin1(emb)))
 
+
 class ClassEmbedding(nn.Module):
     def __init__(self, num_classes=2, n_channels=256):
         super().__init__()
@@ -431,6 +447,7 @@ class ClassEmbedding(nn.Module):
     def forward(self, c):
         emb = self.embedding(c)
         return self.lin2(self.act(self.lin1(emb)))
+
 
 class UNetAttentionBlock(nn.Module):
     def __init__(self, channels, num_heads=4):
@@ -459,6 +476,7 @@ class UNetAttentionBlock(nn.Module):
         output = self.proj(out) + residual
         return output
 
+
 class UNetResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, d_time=256, dropout_rate=0.2):
         super().__init__()
@@ -485,6 +503,7 @@ class UNetResidualBlock(nn.Module):
         h = self.conv2(h)
         return h + self.residual(x)
 
+
 class SwitchSequential(nn.Sequential):
     def forward(self, x, t=None, c=None):
         for layer in self:
@@ -495,6 +514,7 @@ class SwitchSequential(nn.Sequential):
             else:
                 x = layer(x)
         return x
+
 
 class ConditionalUNet(nn.Module):
     def __init__(self, latent_dim=256, hidden_dims=[256, 512, 1024, 512, 256],
@@ -557,6 +577,7 @@ class ConditionalUNet(nn.Module):
         out = self.final(h)
         return out
 
+
 class ConditionalDenoiseDiffusion():
     def __init__(self, eps_model, n_steps=1000, device=None):
         super().__init__()
@@ -601,6 +622,7 @@ class ConditionalDenoiseDiffusion():
         eps_theta = self.eps_model(xt, t, labels)
         return euclidean_distance_loss(eps, eps_theta)
 
+
 # -----------------------------
 # Visualization functions (modified to use CIFAR10CatDog)
 # -----------------------------
@@ -644,6 +666,7 @@ def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./res
     diffusion.eps_model.train()
     print("Generated sample grid for cat/dog classes")
     return save_path
+
 
 def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None):
     device = next(autoencoder.parameters()).device
@@ -781,6 +804,7 @@ def visualize_denoising_steps(autoencoder, diffusion, class_idx, save_path=None)
     diffusion.eps_model.train()
     return save_path
 
+
 def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
     os.makedirs(save_dir, exist_ok=True)
     device = next(autoencoder.parameters()).device
@@ -808,6 +832,7 @@ def visualize_reconstructions(autoencoder, epoch, save_dir="./results"):
     plt.savefig(f"{save_dir}/vae_reconstruction_epoch_{epoch}.png")
     plt.close()
     autoencoder.train()
+
 
 def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
     os.makedirs(save_dir, exist_ok=True)
@@ -842,6 +867,7 @@ def visualize_latent_space(autoencoder, epoch, save_dir="./results"):
         print(f"t-SNE visualization error: {e}")
     autoencoder.train()
 
+
 def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, save_path=None):
     device = next(autoencoder.parameters()).device
     autoencoder.eval()
@@ -869,6 +895,7 @@ def generate_class_samples(autoencoder, diffusion, target_class, num_samples=5, 
         plt.savefig(save_path)
         plt.close()
     return samples
+
 
 def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50, seed=42,
                                save_path=None, temp_dir=None, fps=10, reverse=False):
@@ -948,6 +975,7 @@ def create_diffusion_animation(autoencoder, diffusion, class_idx, num_frames=50,
     print(f"Animation saved to {save_path}")
     return save_path
 
+
 class VGGPerceptualLoss(nn.Module):
     def __init__(self, device):
         super(VGGPerceptualLoss, self).__init__()
@@ -968,6 +996,7 @@ class VGGPerceptualLoss(nn.Module):
         x_features = self.feature_extractor(x)
         y_features = self.feature_extractor(y)
         return self.criterion(x_features, y_features)
+
 
 class Discriminator64(nn.Module):
     def __init__(self, in_channels=3):
@@ -990,6 +1019,7 @@ class Discriminator64(nn.Module):
 
     def forward(self, x):
         return self.model(x).view(-1)
+
 
 # -----------------------------
 # Training functions
@@ -1031,7 +1061,8 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
         epoch_gan_loss = 0
         epoch_total_loss = 0
 
-        kl_weight = min(kl_weight_end, kl_weight_start + (epoch / (num_epochs * 0.6)) * (kl_weight_end - kl_weight_start))
+        kl_weight = min(kl_weight_end,
+                        kl_weight_start + (epoch / (num_epochs * 0.6)) * (kl_weight_end - kl_weight_start))
         autoencoder.kl_weight = kl_weight
 
         print(f"Epoch {epoch + 1}/{num_epochs} - KL Weight: {kl_weight:.6f}")
@@ -1065,8 +1096,10 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
             recon_loss = euclidean_distance_loss(recon_x, data)
             perceptual_loss = vgg_loss(recon_x, data)
             kl_loss = autoencoder.kl_divergence(mu, logvar) if kl_factor > 0 else torch.tensor(0.0, device=device)
-            class_loss = F.cross_entropy(autoencoder.classify(z), labels) if cls_factor > 0 else torch.tensor(0.0, device=device)
-            center_loss = autoencoder.compute_center_loss(z, labels) if center_factor > 0 else torch.tensor(0.0, device=device)
+            class_loss = F.cross_entropy(autoencoder.classify(z), labels) if cls_factor > 0 else torch.tensor(0.0,
+                                                                                                              device=device)
+            center_loss = autoencoder.compute_center_loss(z, labels) if center_factor > 0 else torch.tensor(0.0,
+                                                                                                            device=device)
 
             d_real_loss = gan_criterion(discriminator(data), valid)
             d_fake_loss = gan_criterion(discriminator(recon_x.detach()), fake)
@@ -1088,12 +1121,12 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
                 gan_scale = 1.0
 
             total_loss = (
-                lambda_recon * recon_scale * recon_loss +
-                lambda_vgg * perceptual_scale * perceptual_loss +
-                kl_weight * kl_scale * kl_factor * kl_loss +
-                lambda_cls * cls_factor * class_loss +
-                lambda_center * center_factor * center_loss +
-                lambda_gan * gan_scale * adv_loss
+                    lambda_recon * recon_scale * recon_loss +
+                    lambda_vgg * perceptual_scale * perceptual_loss +
+                    kl_weight * kl_scale * kl_factor * kl_loss +
+                    lambda_cls * cls_factor * class_loss +
+                    lambda_center * center_factor * center_loss +
+                    lambda_gan * gan_scale * adv_loss
             )
 
             total_loss.backward()
@@ -1129,8 +1162,10 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
         loss_history['total'].append(avg_total_loss)
         loss_history['gan'].append(avg_gan_loss)
 
-        print(f"Epoch {epoch + 1}/{num_epochs}, Recon Lambda * Scale: {lambda_recon * recon_scale:.6f}, Perceptual Lambda * Scale: {lambda_vgg * perceptual_scale:.6f}, KL Lambda * Scale: {kl_factor * kl_weight:.6f}, GAN Lambda * Scale: {gan_scale * lambda_gan:.6f}")
-        print(f"Epoch {epoch + 1}/{num_epochs}, Total Loss: {avg_total_loss:.6f}, Recon Loss: {avg_recon_loss:.6f}, Perceptual Loss: {avg_perceptual_loss:.6f}, KL Loss: {avg_kl_loss:.6f}, GAN Loss: {avg_gan_loss:.6f}, Class Loss: {avg_class_loss:.6f}, Center Loss: {avg_center_loss:.6f}")
+        print(
+            f"Epoch {epoch + 1}/{num_epochs}, Recon Lambda * Scale: {lambda_recon * recon_scale:.6f}, Perceptual Lambda * Scale: {lambda_vgg * perceptual_scale:.6f}, KL Lambda * Scale: {kl_factor * kl_weight:.6f}, GAN Lambda * Scale: {gan_scale * lambda_gan:.6f}")
+        print(
+            f"Epoch {epoch + 1}/{num_epochs}, Total Loss: {avg_total_loss:.6f}, Recon Loss: {avg_recon_loss:.6f}, Perceptual Loss: {avg_perceptual_loss:.6f}, KL Loss: {avg_kl_loss:.6f}, GAN Loss: {avg_gan_loss:.6f}, Class Loss: {avg_class_loss:.6f}, Center Loss: {avg_center_loss:.6f}")
 
         if loss_history['total'][-1] < best_loss:
             best_loss = loss_history['total'][-1]
@@ -1150,6 +1185,7 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
     print("Training complete.")
     return autoencoder, discriminator, loss_history
 
+
 def check_and_normalize_latent(autoencoder, data):
     mu, logvar = autoencoder.encode_with_params(data)
     z = autoencoder.reparameterize(mu, logvar)
@@ -1157,6 +1193,7 @@ def check_and_normalize_latent(autoencoder, data):
     std = z.std(dim=0, keepdim=True)
     z_normalized = (z - mean) / (std + 1e-8)
     return z_normalized, mean, std
+
 
 def visualize_latent_comparison(autoencoder, diffusion, data_loader, save_path):
     device = next(autoencoder.parameters()).device
@@ -1190,6 +1227,7 @@ def visualize_latent_comparison(autoencoder, diffusion, data_loader, save_path):
     autoencoder.train()
     diffusion.eps_model.train()
 
+
 def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100, lr=1e-3, visualize_every=10,
                                 save_dir="./results", device=None, start_epoch=0):
     print("Starting Class-Conditional Diffusion Model training with improved strategies...")
@@ -1203,7 +1241,8 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
 
     for epoch in range(start_epoch, start_epoch + num_epochs):
         epoch_loss = 0
-        for batch_idx, (data, labels) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{start_epoch + num_epochs}")):
+        for batch_idx, (data, labels) in enumerate(
+                tqdm(train_loader, desc=f"Epoch {epoch + 1}/{start_epoch + num_epochs}")):
             data = data.to(device)
             labels = labels.to(device)
             with torch.no_grad():
@@ -1234,9 +1273,11 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
     print(f"Saved final diffusion model after {start_epoch + num_epochs} epochs")
     return unet, diffusion, loss_history
 
+
 def main(checkpoint_path=None, total_epochs=2000):
     print("Starting class-conditional diffusion model for CIFAR-10 Cat/Dog with improved architecture")
-    device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = torch.device(
+        "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
     results_dir = "./cifar10_catdog_conditional_improved"
     os.makedirs(results_dir, exist_ok=True)
@@ -1244,13 +1285,14 @@ def main(checkpoint_path=None, total_epochs=2000):
     train_dataset = CIFAR10CatDog(root='./data', train=True, download=True, transform=transform_train)
     global class_names
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    
+
     autoencoder_path = f"{results_dir}/catdog_autoencoder.pt"
     diffusion_path = f"{results_dir}/conditional_diffusion_final.pt"
     autoencoder = SimpleAutoencoder(in_channels=3, latent_dim=256, num_classes=2).to(device)
     if os.path.exists(autoencoder_path):
         print(f"Loading existing autoencoder from {autoencoder_path}")
-        autoencoder.load_state_dict(torch.load(autoencoder_path, map_location=device), strict=False)
+        checkpoint = torch.load(autoencoder_path, map_location=device)
+        autoencoder.load_state_dict(checkpoint['autoencoder'], strict=False)
         autoencoder.eval()
     else:
         print("No existing autoencoder found. Training a new one with improved architecture...")
@@ -1262,7 +1304,7 @@ def main(checkpoint_path=None, total_epochs=2000):
             lambda_cls=0.3,
             lambda_center=0.1,
             lambda_vgg=0.4,
-            visualize_every=300,
+            visualize_every=50,
             save_dir=results_dir
         )
         torch.save(autoencoder.state_dict(), autoencoder_path)
@@ -1285,11 +1327,13 @@ def main(checkpoint_path=None, total_epochs=2000):
         time_emb_dim=256,
         num_classes=2
     ).to(device)
+
     def init_weights(m):
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
             nn.init.kaiming_normal_(m.weight, a=0.2)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
+
     start_epoch = 0
     if checkpoint_path and os.path.exists(checkpoint_path):
         try:
@@ -1369,6 +1413,7 @@ def main(checkpoint_path=None, total_epochs=2000):
     print("Denoising visualizations:")
     for i, path in enumerate(denoising_paths):
         print(f"  - {class_names[i]}: {path}")
+
 
 if __name__ == "__main__":
     main(total_epochs=10000)
