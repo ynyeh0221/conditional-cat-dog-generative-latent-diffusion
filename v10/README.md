@@ -151,3 +151,28 @@ The diffusion model operates by:
 2. Training a neural network to reverse this process
 3. Starting from random noise and iteratively denoising to produce a class-specific sample
 4. Projecting the final denoised latent vector through the VAE decoder
+
+## Citation
+
+If you use this code in your research, please cite:
+
+```
+@software{cifar10_catdog_diffusion,
+  author = {Your Name},
+  title = {CIFAR-10 Cat/Dog Conditional Diffusion Model},
+  year = {2023},
+  url = {https://github.com/yourusername/cifar10-catdog-diffusion}
+}
+```
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Acknowledgements
+
+- The CIFAR-10 dataset is provided by the Canadian Institute for Advanced Research
+- This implementation builds on concepts from:
+  - "Denoising Diffusion Probabilistic Models" (Ho et al., 2020)
+  - "Diffusion Models Beat GANs on Image Synthesis" (Dhariwal & Nichol, 2021)
+  - "Learning Transferable Visual Models From Natural Language Supervision" (Radford et al., 2021)
