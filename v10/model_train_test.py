@@ -12,8 +12,9 @@ from tqdm.auto import tqdm
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import imageio
-from google.colab import drive
 
+# If using Colab
+from google.colab import drive
 drive.mount('/content/drive')
 
 # Set random seed for reproducibility
