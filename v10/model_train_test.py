@@ -1322,7 +1322,7 @@ def main(checkpoint_path=None, total_epochs=2000):
     if 'diffusion' not in globals():
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
             autoencoder, conditional_unet, train_loader, num_epochs=remaining_epochs, lr=1e-3,
-            visualize_every=1,
+            visualize_every=50,
             save_dir=results_dir,
             device=device,
             start_epoch=start_epoch
