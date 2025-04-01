@@ -31,7 +31,7 @@ transform_test = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-batch_size = 64  # adjust based on available GPU memory
+batch_size = 128  # adjust based on available GPU memory
 
 # For CIFAR-10 cat/dog, we have 2 classes.
 class_names = ["cat", "dog"]
@@ -553,7 +553,7 @@ class ConditionalUNet(nn.Module):
             h = h + c_emb_final
         h = self.final_norm(h)
         out = self.final(h)
-        return out
+        return out + torch.sigmoid(self.residual_weight) * self.final(residual)
 
 class ConditionalDenoiseDiffusion():
     def __init__(self, eps_model, n_steps=1000, device=None):
@@ -1246,7 +1246,7 @@ def main(checkpoint_path=None, total_epochs=2000):
     global class_names
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
-    autoencoder_path = f"{results_dir}/catdog_autoencoder.pt"
+    autoencoder_path = f"{results_dir}/vae_gan_final.pt"
     diffusion_path = f"{results_dir}/conditional_diffusion_final.pt"
     autoencoder = SimpleAutoencoder(in_channels=3, latent_dim=256, num_classes=2).to(device)
     if os.path.exists(autoencoder_path):
@@ -1256,7 +1256,7 @@ def main(checkpoint_path=None, total_epochs=2000):
         autoencoder.eval()
     else:
         print("No existing autoencoder found. Training a new one with improved architecture...")
-        autoencoder, ae_losses, _ = train_autoencoder(
+        autoencoder, discriminator, ae_losses = train_autoencoder(
             autoencoder,
             train_loader,
             num_epochs=1200,
@@ -1264,7 +1264,7 @@ def main(checkpoint_path=None, total_epochs=2000):
             lambda_cls=0.3,
             lambda_center=0.1,
             lambda_vgg=0.4,
-            visualize_every=1,
+            visualize_every=50,
             save_dir=results_dir
         )
         torch.save(autoencoder.state_dict(), autoencoder_path)
