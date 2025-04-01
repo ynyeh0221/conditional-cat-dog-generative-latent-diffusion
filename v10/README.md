@@ -152,18 +152,6 @@ The diffusion model operates by:
 3. Starting from random noise and iteratively denoising to produce a class-specific sample
 4. Projecting the final denoised latent vector through the VAE decoder
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```
-@software{cifar10_catdog_diffusion,
-  author = {Your Name},
-  title = {CIFAR-10 Cat/Dog Conditional Diffusion Model},
-  year = {2023},
-  url = {https://github.com/yourusername/cifar10-catdog-diffusion}
-}
-```
 
 ## License
 
