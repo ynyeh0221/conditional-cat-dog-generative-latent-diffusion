@@ -1243,7 +1243,7 @@ def main(checkpoint_path=None, total_epochs=2000):
     device = torch.device(
         "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
-    results_dir = "./cifar10_catdog_conditional_improved"
+    results_dir = "/content/drive/MyDrive/cifar10_catdog_conditional_improved"
     os.makedirs(results_dir, exist_ok=True)
     print("Loading CIFAR-10 dataset for cat/dog...")
     train_dataset = CIFAR10CatDog(root='./data', train=True, download=True, transform=transform_train)
