@@ -1264,7 +1264,7 @@ def main(checkpoint_path=None, total_epochs=2000):
         autoencoder, discriminator, ae_losses = train_autoencoder(
             autoencoder,
             train_loader,
-            num_epochs=1200,
+            num_epochs=2000,
             lr=1e-4,
             lambda_cls=0.3,
             lambda_center=0.1,
@@ -1380,4 +1380,4 @@ def main(checkpoint_path=None, total_epochs=2000):
         print(f"  - {class_names[i]}: {path}")
 
 if __name__ == "__main__":
-    main(total_epochs=10000)
+    main(total_epochs=5000)
