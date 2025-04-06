@@ -118,6 +118,16 @@ The project includes multiple visualization capabilities:
 4. **Sample Grid Generation**: Create a grid of generated samples from each class
 5. **Diffusion Animation**: Animate the denoising process from random noise to a clear image
 
+Model Component | Visualization | Description |
+|-----------------|---------------|-------------|
+| GAN-VAE | ![Reconstructions](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v11/output/reconstruction/vae_reconstruction_epoch_3000.png) | Original images (top) and their reconstructions (bottom) |
+| Latent Space | ![Latent Space](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v11/output/latent_space/vae_latent_space_epoch_3000.png) | t-SNE visualization of cat and dog latent representations |
+| Original image v.s. Reconstruction v.s. Reconstruction from noised/denoised latent space | ![](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v11/output/diffusion_latent_space_comparison/latent_comparison_epoch_2750.png) | First row is the reconstructed image from original image's latent space. Second row is the reconstructed image from original image's latent space with noising/denoising. Third row is the original image |
+| Class Samples | ![Class Samples](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v11/output/diffusion_sample_result/sample_class_cat_epoch_2750.png)![Class Samples](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v11/output/diffusion_sample_result/sample_class_dog_epoch_2750.png) | Generated samples for cat and dog classes |
+| Denoising Process | ![Denoising Cat](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v11/output/diffusion_path/denoising_path_cat_epoch_2750.png)![Denoising Dog](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v11/output/diffusion_path/denoising_path_dog_epoch_2750.png) | Visualization of cat generation process and latent path |
+| Animation | ![Cat Animation](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v11/output/animination/diffusion_animation_cat_epoch_2750.gif)![Dog Animation](https://github.com/ynyeh0221/CIFAR10-cat-dog-generative-latent-diffusion/blob/main/v11/output/animination/diffusion_animation_dog_epoch_2750.gif) | Animation of the denoising process for cat generation |
+
+
 ## Customization
 
 - Modify the `class_names` list to work with different classes
