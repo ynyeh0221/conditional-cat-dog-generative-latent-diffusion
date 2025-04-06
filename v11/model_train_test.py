@@ -17,14 +17,11 @@ import imageio
 from google.colab import drive
 drive.mount('/content/drive')
 
-# Set random seed for reproducibility
-torch.manual_seed(42)
-np.random.seed(42)
-
-# ----------------------------------
-# Transforms for STL10 (original resolution 96x96)
-# ----------------------------------
+# -----------------------------
+# Updated Transforms (Resize from 96 to 48)
+# -----------------------------
 transform_train = transforms.Compose([
+    transforms.Resize((48, 48)),  # Resize STL10 images from 96x96 to 48x48
     transforms.RandomHorizontalFlip(),
     transforms.RandomRotation(10),
     transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
@@ -32,23 +29,27 @@ transform_train = transforms.Compose([
 ])
 
 transform_test = transforms.Compose([
+    transforms.Resize((48, 48)),  # Resize for testing as well
     transforms.ToTensor(),
 ])
 
-batch_size = 128  # adjust based on available GPU memory
+batch_size = 256  # Adjust based on available GPU memory
 
-# For STL10 cat/dog, we have 2 classes.
+# Global class names for cat and dog
 class_names = ["cat", "dog"]
 
 # -----------------------------
-# Custom dataset: STL10CatDog
+# Updated dataset class for STL10 Cat/Dog
 # -----------------------------
 class STL10CatDog(datasets.STL10):
     def __init__(self, *args, **kwargs):
-        # The STL10 dataset uses the argument "split" (e.g., 'train' or 'test')
+        # Support backward compatibility if 'train' flag is used:
+        if 'train' in kwargs:
+            train = kwargs.pop('train')
+            kwargs['split'] = 'train' if train else 'test'
         super(STL10CatDog, self).__init__(*args, **kwargs)
-        # STL10 classes are: ['airplane', 'bird', 'car', 'cat', 'deer', 'dog', 'horse', 'monkey', 'ship', 'truck']
-        # cat index is 3 and dog index is 5.
+        # STL10 classes: ['airplane','bird','car','cat','deer','dog','horse','monkey','ship','truck']
+        # We want cat (index 3) and dog (index 5)
         cat_dog_idx = [3, 5]
         mask = np.isin(self.labels, cat_dog_idx)
         self.data = self.data[mask]
@@ -57,7 +58,7 @@ class STL10CatDog(datasets.STL10):
         self.labels = [0 if t == 3 else 1 for t in self.labels]
 
 # -----------------------------
-# Model definitions (with adjustments for 96x96 STL10 images)
+# Auxiliary Modules (Activation, Attention, etc.)
 # -----------------------------
 class Swish(nn.Module):
     def forward(self, x):
@@ -73,7 +74,6 @@ class CALayer(nn.Module):
             nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=False),
             nn.Sigmoid()
         )
-
     def forward(self, x):
         y = self.avg_pool(x)
         y = self.conv_du(y)
@@ -84,7 +84,6 @@ class SpatialAttention(nn.Module):
         super(SpatialAttention, self).__init__()
         self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False)
         self.sigmoid = nn.Sigmoid()
-
     def forward(self, x):
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
@@ -93,74 +92,12 @@ class SpatialAttention(nn.Module):
         attention = self.sigmoid(attention)
         return x * attention
 
-class CenterLoss(nn.Module):
-    def __init__(self, num_classes=2, feat_dim=256, min_distance=1.0, repulsion_strength=1.0):
-        super(CenterLoss, self).__init__()
-        self.num_classes = num_classes
-        self.feat_dim = feat_dim
-        self.min_distance = min_distance
-        self.repulsion_strength = repulsion_strength
-        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim))
-
-        with torch.no_grad():
-            if num_classes == 2:
-                self.centers[0] = -torch.ones(feat_dim) / math.sqrt(feat_dim)
-                self.centers[1] = torch.ones(feat_dim) / math.sqrt(feat_dim)
-            else:
-                for i in range(num_classes):
-                    self.centers[i] = torch.randn(feat_dim)
-                    self.centers[i] = self.centers[i] / torch.norm(self.centers[i]) * 2.0
-
-    def compute_pairwise_distances(self, x, y):
-        n = x.size(0)
-        m = y.size(0)
-        x_norm = (x ** 2).sum(1).view(n, 1)
-        y_norm = (y ** 2).sum(1).view(1, m)
-        distmat = x_norm + y_norm - 2.0 * torch.mm(x, y.transpose(0, 1))
-        distmat = torch.clamp(distmat, min=1e-12)
-        distmat = torch.sqrt(distmat)
-        return distmat
-
-    def forward(self, x, labels):
-        batch_size = x.size(0)
-        distmat = self.compute_pairwise_distances(x, self.centers)
-        classes = torch.arange(self.num_classes).to(labels.device)
-        labels_expanded = labels.unsqueeze(1).expand(batch_size, self.num_classes)
-        mask = labels_expanded.eq(classes.expand(batch_size, self.num_classes))
-        attraction_dist = distmat * mask.float()
-        attraction_loss = attraction_dist.sum() / batch_size
-        center_distances = self.compute_pairwise_distances(self.centers, self.centers)
-        diff_mask = 1.0 - torch.eye(self.num_classes, device=x.device)
-        repulsion_loss = torch.clamp(self.min_distance - center_distances, min=0.0)
-        repulsion_loss = (repulsion_loss * diff_mask).sum() / (self.num_classes * (self.num_classes - 1) + 1e-6)
-        intra_class_variance = 0.0
-        for c in range(self.num_classes):
-            class_mask = (labels == c)
-            if torch.sum(class_mask) > 1:
-                class_samples = x[class_mask]
-                class_center = torch.mean(class_samples, dim=0)
-                variance = torch.mean(torch.sum((class_samples - class_center) ** 2, dim=1))
-                intra_class_variance += variance
-        if self.num_classes > 0:
-            intra_class_variance = intra_class_variance / self.num_classes
-        total_loss = attraction_loss + self.repulsion_strength * repulsion_loss - 0.1 * intra_class_variance
-        with torch.no_grad():
-            self.avg_center_dist = torch.sum(center_distances * diff_mask) / (
-                        self.num_classes * (self.num_classes - 1) + 1e-6)
-            self.avg_sample_dist = torch.mean(distmat)
-            self.center_attraction = attraction_loss.item()
-            self.center_repulsion = repulsion_loss.item()
-            self.intra_variance = intra_class_variance.item() if isinstance(intra_class_variance,
-                                                                            torch.Tensor) else intra_class_variance
-        return total_loss
-
 class LayerNorm2d(nn.Module):
     def __init__(self, num_channels, eps=1e-5):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(num_channels))
         self.bias = nn.Parameter(torch.zeros(num_channels))
         self.eps = eps
-
     def forward(self, x):
         mean = x.mean(dim=(2, 3), keepdim=True)
         var = x.var(dim=(2, 3), keepdim=True, unbiased=False)
@@ -178,7 +115,6 @@ class ResidualBlock(nn.Module):
         self.ln2 = LayerNorm2d(channels)
         self.ca = CALayer(channels)
         self.sa = SpatialAttention()
-
     def forward(self, x):
         residual = x
         out = self.swish(self.ln1(self.conv1(x)))
@@ -189,6 +125,11 @@ class ResidualBlock(nn.Module):
         out = self.swish(out)
         return out
 
+# -----------------------------
+# Modified Encoder & Decoder for 48x48 images
+# -----------------------------
+# Encoder for 48x48 input images:
+# Three downsampling steps: 48→24, 24→12, 12→6 so that the feature map is 6x6.
 class Encoder(nn.Module):
     def __init__(self, in_channels=3, latent_dim=256):
         super().__init__()
@@ -200,37 +141,36 @@ class Encoder(nn.Module):
         )
         self.skip_features = []
         self.down1 = nn.Sequential(
-            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # 96x96 -> 48x48
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # 48x48 -> 24x24
             LayerNorm2d(128),
             Swish()
         )
         self.res1 = ResidualBlock(128)
         self.down2 = nn.Sequential(
-            nn.Conv2d(128, 256, 4, stride=2, padding=1),  # 48x48 -> 24x24
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),  # 24x24 -> 12x12
             LayerNorm2d(256),
             Swish()
         )
         self.res2 = ResidualBlock(256)
         self.down3 = nn.Sequential(
-            nn.Conv2d(256, 512, 4, stride=2, padding=1),  # 24x24 -> 12x12
+            nn.Conv2d(256, 512, 4, stride=2, padding=1),  # 12x12 -> 6x6
             LayerNorm2d(512),
             Swish()
         )
         self.res3 = ResidualBlock(512)
-        # For STL10 input (96x96), after 3 downsamples the feature map is 12x12
+        # Fully connected layers now use a flattened size of 512*6*6
         self.fc_mu = nn.Sequential(
-            nn.Linear(512 * 12 * 12, 512),
+            nn.Linear(512 * 6 * 6, 512),
             nn.LayerNorm(512),
             Swish(),
             nn.Linear(512, latent_dim)
         )
         self.fc_logvar = nn.Sequential(
-            nn.Linear(512 * 12 * 12, 512),
+            nn.Linear(512 * 6 * 6, 512),
             nn.LayerNorm(512),
             Swish(),
             nn.Linear(512, latent_dim)
         )
-
     def forward(self, x):
         self.skip_features = []
         x = self.initial_conv(x)
@@ -249,34 +189,35 @@ class Encoder(nn.Module):
         logvar = self.fc_logvar(x_flat)
         return mu, logvar
 
+# Decoder for 48x48 images:
+# The decoder first projects the latent vector to a 512*6*6 feature map and then upsamples.
 class Decoder(nn.Module):
     def __init__(self, latent_dim=256, out_channels=3):
         super().__init__()
         self.latent_dim = latent_dim
-        # For 96x96 images, we project to a 12x12 feature map.
         self.fc = nn.Sequential(
             nn.Linear(latent_dim, 512),
             nn.LayerNorm(512),
             Swish(),
-            nn.Linear(512, 512 * 12 * 12),
-            nn.LayerNorm(512 * 12 * 12),
+            nn.Linear(512, 512 * 6 * 6),
+            nn.LayerNorm(512 * 6 * 6),
             Swish()
         )
         self.res3 = ResidualBlock(512)
         self.up3 = nn.Sequential(
-            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),  # 12x12 -> 24x24
+            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),  # 6x6 -> 12x12
             nn.GroupNorm(32, 256),
             Swish()
         )
         self.res2 = ResidualBlock(256)
         self.up2 = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # 24x24 -> 48x48
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # 12x12 -> 24x24
             nn.GroupNorm(16, 128),
             Swish()
         )
         self.res1 = ResidualBlock(128)
         self.up1 = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # 48x48 -> 96x96
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # 24x24 -> 48x48
             nn.GroupNorm(8, 64),
             Swish()
         )
@@ -287,10 +228,9 @@ class Decoder(nn.Module):
             nn.Conv2d(32, out_channels, 3, padding=1),
             nn.Sigmoid()
         )
-
     def forward(self, z, encoder_features=None):
         x = self.fc(z)
-        x = x.view(-1, 512, 12, 12)
+        x = x.view(-1, 512, 6, 6)
         x = self.res3(x)
         x = self.up3(x)
         x = self.res2(x)
@@ -300,17 +240,9 @@ class Decoder(nn.Module):
         x = self.final_conv(x)
         return x
 
-def euclidean_distance_loss(x, y, reduction='mean'):
-    squared_diff = (x - y) ** 2
-    squared_dist = squared_diff.view(x.size(0), -1).sum(dim=1)
-    euclidean_dist = torch.sqrt(squared_dist + 1e-8)
-    if reduction == 'mean':
-        return euclidean_dist.mean()
-    elif reduction == 'sum':
-        return euclidean_dist.sum()
-    else:
-        return euclidean_dist
-
+# -----------------------------
+# SimpleAutoencoder Model (with classifier and VAE parts)
+# -----------------------------
 class SimpleAutoencoder(nn.Module):
     def __init__(self, in_channels=3, latent_dim=256, num_classes=2):
         super().__init__()
@@ -331,7 +263,6 @@ class SimpleAutoencoder(nn.Module):
         self.register_buffer('class_centers', torch.zeros(num_classes, latent_dim))
         self.register_buffer('center_counts', torch.zeros(num_classes))
         self.apply(self._init_weights)
-
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.kaiming_normal_(m.weight, a=0.2)
@@ -344,37 +275,30 @@ class SimpleAutoencoder(nn.Module):
             nn.init.kaiming_normal_(m.weight, a=0.2)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-
     def reparameterize(self, mu, logvar):
         logvar = torch.clamp(logvar, min=-2.0, max=10.0)
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
-
     def encode(self, x):
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
         return z
-
     def encode_with_params(self, x):
         mu, logvar = self.encoder(x)
         logvar = torch.clamp(logvar, min=-2.0, max=10.0)
         return mu, logvar
-
     def decode(self, z):
         encoder_features = getattr(self, 'stored_encoder_features', None)
         return self.decoder(z, encoder_features)
-
     def classify(self, z):
         return self.classifier(z)
-
     def compute_center_loss(self, z, labels):
         centers_batch = self.class_centers[labels]
         squared_diff = (z - centers_batch) ** 2
         squared_dist = squared_diff.sum(dim=1)
         center_loss = torch.sqrt(squared_dist + 1e-8).mean()
         return center_loss
-
     def update_centers(self, z, labels, momentum=0.9):
         unique_labels = torch.unique(labels)
         for label in unique_labels:
@@ -385,7 +309,6 @@ class SimpleAutoencoder(nn.Module):
                 old_center = self.class_centers[label]
                 new_center = momentum * old_center + (1 - momentum) * class_mean
                 self.class_centers[label] = new_center
-
     def kl_divergence(self, mu, logvar):
         mu = torch.clamp(mu, min=-10.0, max=10.0)
         logvar = torch.clamp(logvar, min=-2.0, max=10.0)
@@ -393,7 +316,6 @@ class SimpleAutoencoder(nn.Module):
         kl_loss = torch.clamp(kl_loss, min=0.0, max=100.0).mean()
         mu_reg = 1e-4 * torch.sum(mu.pow(2))
         return kl_loss + mu_reg
-
     def forward(self, x):
         mu, logvar = self.encoder(x)
         z = self.reparameterize(mu, logvar)
@@ -411,7 +333,6 @@ class TimeEmbedding(nn.Module):
         self.lin1 = nn.Linear(self.n_channels, self.n_channels * 2)
         self.act = Swish()
         self.lin2 = nn.Linear(self.n_channels * 2, self.n_channels)
-
     def forward(self, t):
         half_dim = self.n_channels // 2
         emb = math.log(10000) / (half_dim - 1)
@@ -430,7 +351,6 @@ class ClassEmbedding(nn.Module):
         self.lin1 = nn.Linear(n_channels, n_channels)
         self.act = Swish()
         self.lin2 = nn.Linear(n_channels, n_channels)
-
     def forward(self, c):
         emb = self.embedding(c)
         return self.lin2(self.act(self.lin1(emb)))
@@ -443,7 +363,6 @@ class UNetAttentionBlock(nn.Module):
         self.norm = nn.GroupNorm(1, channels)
         self.qkv = nn.Conv2d(channels, channels * 3, 1)
         self.proj = nn.Conv2d(channels, channels, 1)
-
     def forward(self, x):
         b, c, h, w = x.shape
         residual = x
@@ -474,7 +393,6 @@ class UNetResidualBlock(nn.Module):
         self.norm2 = LayerNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
         self.residual = nn.Identity() if in_channels == out_channels else nn.Conv2d(in_channels, out_channels, 1)
-
     def forward(self, x, t, c=None):
         h = self.act(self.norm1(x))
         h = self.conv1(h)
@@ -531,7 +449,6 @@ class ConditionalUNet(nn.Module):
         self.final_norm = nn.LayerNorm(hidden_dims[-1])
         self.final = nn.Linear(hidden_dims[-1], latent_dim)
         self.residual_weight = nn.Parameter(torch.tensor(0.1))
-
     def forward(self, x, t, c=None):
         residual = x
         t_emb_base = self.time_emb(t)
@@ -569,13 +486,11 @@ class ConditionalDenoiseDiffusion():
         self.alpha = 1 - self.beta
         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
         self.n_steps = n_steps
-
     def q_sample(self, x0, t, eps=None):
         if eps is None:
             eps = torch.randn_like(x0)
         alpha_bar_t = self.alpha_bar[t].reshape(-1, 1)
         return torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * eps
-
     def p_sample(self, xt, t, c=None):
         if not isinstance(t, torch.Tensor):
             t = torch.tensor([t], device=xt.device)
@@ -589,13 +504,11 @@ class ConditionalDenoiseDiffusion():
             return mean + torch.sqrt(var) * noise
         else:
             return mean
-
     def sample(self, shape, device, c=None):
         x = torch.randn(shape, device=device)
         for t in tqdm(reversed(range(self.n_steps)), desc="Sampling"):
             x = self.p_sample(x, t, c)
         return x
-
     def loss(self, x0, labels=None):
         batch_size = x0.shape[0]
         t = torch.randint(0, self.n_steps, (batch_size,), device=x0.device, dtype=torch.long)
@@ -604,8 +517,19 @@ class ConditionalDenoiseDiffusion():
         eps_theta = self.eps_model(xt, t, labels)
         return euclidean_distance_loss(eps, eps_theta)
 
+def euclidean_distance_loss(x, y, reduction='mean'):
+    squared_diff = (x - y) ** 2
+    squared_dist = squared_diff.view(x.size(0), -1).sum(dim=1)
+    euclidean_dist = torch.sqrt(squared_dist + 1e-8)
+    if reduction == 'mean':
+        return euclidean_dist.mean()
+    elif reduction == 'sum':
+        return euclidean_dist.sum()
+    else:
+        return euclidean_dist
+
 # -----------------------------
-# Visualization functions
+# Visualization Functions
 # -----------------------------
 def generate_samples_grid(autoencoder, diffusion, n_per_class=5, save_dir="./results"):
     os.makedirs(save_dir, exist_ok=True)
@@ -959,7 +883,6 @@ class VGGPerceptualLoss(nn.Module):
         self.criterion = euclidean_distance_loss
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device))
-
     def forward(self, x, y):
         device = next(self.parameters()).device
         x = x.to(device)
@@ -970,34 +893,38 @@ class VGGPerceptualLoss(nn.Module):
         y_features = self.feature_extractor(y)
         return self.criterion(x_features, y_features)
 
+# -----------------------------
+# Updated Discriminator
+# -----------------------------
 class Discriminator64(nn.Module):
     def __init__(self, in_channels=3):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 4, stride=2, padding=1),  # 96x96 -> 48x48
+            nn.Conv2d(in_channels, 64, 4, stride=2, padding=1),  # 48x48 -> 24x24
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # 48x48 -> 24x24
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),  # 24x24 -> 12x12
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(128, 256, 4, stride=2, padding=1),  # 24x24 -> 12x12
+            nn.Conv2d(128, 256, 4, stride=2, padding=1),  # 12x12 -> 6x6
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(256, 512, 4, stride=2, padding=1),  # 12x12 -> 6x6 (if applicable)
+            nn.Conv2d(256, 512, 4, stride=2, padding=1),  # 6x6 -> 3x3
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv2d(512, 1, 2),  # output single value
+            nn.Conv2d(512, 1, 2),  # Output: (batch, 1, 2, 2)
             nn.Sigmoid()
         )
-
     def forward(self, x):
-        return self.model(x).view(-1)
+        out = self.model(x)              # shape: (batch, 1, 2, 2)
+        out = out.view(x.size(0), -1)      # shape: (batch, 4)
+        return out.mean(dim=1)           # average to get (batch,)
 
 # -----------------------------
-# Training functions
+# Training Functions
 # -----------------------------
 def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
                       lambda_cls=0.1, lambda_center=0.05, lambda_vgg=0.4, lambda_gan=0.2,
-                      kl_weight_start=0.001, kl_weight_end=0.05,
+                      kl_weight_start=0.001, kl_weight_end=0.02,
                       visualize_every=10, save_dir="./results"):
     print("Starting VAE-GAN training with perceptual loss enhancement...")
     os.makedirs(save_dir, exist_ok=True)
@@ -1244,12 +1171,11 @@ def main(checkpoint_path=None, total_epochs=2000):
     device = torch.device(
         "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
-    results_dir = "/content/drive/MyDrive/stl10_catdog_conditional_improved"
+    results_dir = "/content/drive/MyDrive/stl10_catdog_conditional_improved2"
     os.makedirs(results_dir, exist_ok=True)
     print("Loading STL10 dataset for cat/dog...")
     train_dataset = STL10CatDog(root='./data', split='train', download=True, transform=transform_train)
-    global class_names
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
 
     autoencoder_path = f"{results_dir}/vae_gan_final.pt"
     diffusion_path = f"{results_dir}/conditional_diffusion_final.pt"
@@ -1264,12 +1190,12 @@ def main(checkpoint_path=None, total_epochs=2000):
         autoencoder, discriminator, ae_losses = train_autoencoder(
             autoencoder,
             train_loader,
-            num_epochs=2000,
-            lr=1e-4,
+            num_epochs=10000,
+            lr=5e-4,
             lambda_cls=0.3,
             lambda_center=0.1,
             lambda_vgg=0.4,
-            visualize_every=50,
+            visualize_every=100,
             save_dir=results_dir
         )
         torch.save(autoencoder.state_dict(), autoencoder_path)
@@ -1292,13 +1218,11 @@ def main(checkpoint_path=None, total_epochs=2000):
         time_emb_dim=256,
         num_classes=2
     ).to(device)
-
     def init_weights(m):
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
             nn.init.kaiming_normal_(m.weight, a=0.2)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-
     start_epoch = 0
     if checkpoint_path and os.path.exists(checkpoint_path):
         try:
@@ -1323,7 +1247,7 @@ def main(checkpoint_path=None, total_epochs=2000):
     if 'diffusion' not in globals():
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
             autoencoder, conditional_unet, train_loader, num_epochs=remaining_epochs, lr=1e-3,
-            visualize_every=50,
+            visualize_every=100,
             save_dir=results_dir,
             device=device,
             start_epoch=start_epoch
@@ -1340,7 +1264,7 @@ def main(checkpoint_path=None, total_epochs=2000):
     elif start_epoch > 0:
         conditional_unet, diffusion, diff_losses = train_conditional_diffusion(
             autoencoder, conditional_unet, train_loader, num_epochs=remaining_epochs, lr=1e-3,
-            visualize_every=50,
+            visualize_every=100,
             save_dir=results_dir,
             device=device,
             start_epoch=start_epoch
@@ -1380,4 +1304,4 @@ def main(checkpoint_path=None, total_epochs=2000):
         print(f"  - {class_names[i]}: {path}")
 
 if __name__ == "__main__":
-    main(total_epochs=5000)
+    main(total_epochs=10000)
