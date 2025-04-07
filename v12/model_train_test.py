@@ -418,64 +418,142 @@ class SwitchSequential(nn.Sequential):
         return x
 
 class ConditionalUNet(nn.Module):
-    def __init__(self, latent_dim=256, hidden_dims=[256, 512, 1024, 512, 256],
-                 time_emb_dim=256, num_classes=2, dropout_rate=0.3):
+    def __init__(self, latent_dim=256, time_emb_dim=256, num_classes=2, base_channels=64):
+        """
+        This convolutional UNet operates on a 2D feature map representation of the latent code.
+        Here we reshape the latent vector of shape (B, 256) into a feature map of shape (B, 4, 8, 8)
+        (since 4*8*8 = 256). The network then applies two encoder blocks, a bottleneck, and two decoder
+        blocks while incorporating conditioning via time and class embeddings.
+        """
         super().__init__()
+        # Set the target 2D dimensions; here we choose 8x8 with 4 channels (4*8*8 = 256)
+        self.H = 8
+        self.W = 8
+        self.in_channels = latent_dim // (self.H * self.W)  # should be 256 // 64 = 4
         self.latent_dim = latent_dim
         self.time_emb_dim = time_emb_dim
-        self.time_emb = TimeEmbedding(n_channels=time_emb_dim)
-        self.class_emb = ClassEmbedding(num_classes=num_classes, n_channels=time_emb_dim)
-        self.latent_proj = nn.Linear(latent_dim, hidden_dims[0])
-        self.time_projections = nn.ModuleList([
-            nn.Linear(time_emb_dim, dim) for dim in hidden_dims
-        ])
-        self.attention_layers = nn.ModuleList([
-            nn.MultiheadAttention(embed_dim=dim, num_heads=8, dropout=dropout_rate)
-            for dim in hidden_dims
-        ])
-        self.layers = nn.ModuleList()
-        for i in range(len(hidden_dims) - 1):
-            residual_block = nn.Sequential(
-                nn.Linear(hidden_dims[i], hidden_dims[i]),
-                nn.LayerNorm(hidden_dims[i]),
-                nn.Dropout(dropout_rate),
-                Swish()
-            )
-            layer_norm = nn.LayerNorm(hidden_dims[i])
-            proj = nn.Linear(hidden_dims[i], hidden_dims[i + 1])
-            self.layers.append(nn.ModuleList([residual_block, layer_norm, proj]))
-        self.final_time_proj = nn.Linear(time_emb_dim, hidden_dims[-1])
-        self.final_class_proj = nn.Linear(time_emb_dim, hidden_dims[-1])
-        self.final_norm = nn.LayerNorm(hidden_dims[-1])
-        self.final = nn.Linear(hidden_dims[-1], latent_dim)
-        self.residual_weight = nn.Parameter(torch.tensor(0.1))
-    def forward(self, x, t, c=None):
-        residual = x
-        t_emb_base = self.time_emb(t)
-        c_emb_base = self.class_emb(c) if c is not None else None
-        h = self.latent_proj(x)
-        for i, (block, layer_norm, downsample) in enumerate(self.layers):
-            t_emb = self.time_projections[i](t_emb_base)
-            h = h + t_emb
-            if c_emb_base is not None:
-                c_emb = self.time_projections[i](c_emb_base)
-                h = h + c_emb
-            h_residual = h
-            h = block(h)
-            h = h + h_residual
-            h_norm = layer_norm(h)
-            h_attn = h_norm.unsqueeze(0)
-            h_attn, _ = self.attention_layers[i](h_attn, h_attn, h_attn)
-            h = h + h_attn.squeeze(0)
-            h = downsample(h)
-        t_emb_final = self.final_time_proj(t_emb_base)
-        h = h + t_emb_final
-        if c_emb_base is not None:
-            c_emb_final = self.final_class_proj(c_emb_base)
-            h = h + c_emb_final
-        h = self.final_norm(h)
-        out = self.final(h)
-        return out + torch.sigmoid(self.residual_weight) * self.final(residual)
+
+        # Time and class embeddings for conditioning
+        self.time_embedding = TimeEmbedding(n_channels=time_emb_dim)
+        self.class_embedding = ClassEmbedding(num_classes=num_classes, n_channels=time_emb_dim)
+
+        # Project latent vector to a feature map of shape (B, 4, 8, 8)
+        self.project_in = nn.Linear(latent_dim, self.in_channels * self.H * self.W)
+
+        # -------------------- Encoder --------------------
+        # Encoder Block 1: keeps resolution at 8x8
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(self.in_channels, base_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, base_channels),
+            Swish(),
+            nn.Conv2d(base_channels, base_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(8, base_channels),
+            Swish()
+        )
+        # Conditioning for encoder block 1
+        self.time_proj_enc1 = nn.Linear(time_emb_dim, base_channels)
+        self.class_proj_enc1 = nn.Linear(time_emb_dim, base_channels)
+
+        # Encoder Block 2: downsample from 8x8 to 4x4
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(base_channels, base_channels * 2, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, base_channels * 2),
+            Swish(),
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),
+            nn.GroupNorm(8, base_channels * 2),
+            Swish()
+        )
+        self.time_proj_enc2 = nn.Linear(time_emb_dim, base_channels * 2)
+        self.class_proj_enc2 = nn.Linear(time_emb_dim, base_channels * 2)
+
+        # -------------------- Bottleneck --------------------
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),
+            nn.GroupNorm(8, base_channels * 2),
+            Swish(),
+            nn.Conv2d(base_channels * 2, base_channels * 2, kernel_size=3, padding=1),
+            nn.GroupNorm(8, base_channels * 2),
+            Swish()
+        )
+        self.time_proj_bottleneck = nn.Linear(time_emb_dim, base_channels * 2)
+        self.class_proj_bottleneck = nn.Linear(time_emb_dim, base_channels * 2)
+
+        # -------------------- Decoder --------------------
+        # Decoder Block 1: upsample from 4x4 back to 8x8
+        self.dec1 = nn.Sequential(
+            nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, base_channels),
+            Swish()
+        )
+        self.time_proj_dec1 = nn.Linear(time_emb_dim, base_channels)
+        self.class_proj_dec1 = nn.Linear(time_emb_dim, base_channels)
+
+        # Decoder Block 2: refine features at 8x8 resolution
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(base_channels, self.in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups=min(8, self.in_channels), num_channels=self.in_channels),
+            Swish(),
+            nn.Conv2d(self.in_channels, self.in_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(num_groups=min(8, self.in_channels), num_channels=self.in_channels),
+            Swish()
+        )
+
+        # Project the refined feature map back to a latent vector
+        self.project_out = nn.Linear(self.in_channels * self.H * self.W, latent_dim)
+        # Learnable ratio for residual connection
+        self.res_ratio = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, z, t, c):
+      """
+      z: latent vector of shape (B, latent_dim)
+      t: time-step tensor of shape (B,) or (B, 1)
+      c: class label tensor of shape (B,)
+      """
+      batch_size = z.size(0)
+
+      # Compute time and class conditioning embeddings
+      t_emb = self.time_embedding(t)  # (B, time_emb_dim)
+      c_emb = self.class_embedding(c)   # (B, time_emb_dim)
+
+      # Project the latent vector to a 2D feature map
+      x = self.project_in(z)  # (B, in_channels * H * W)
+      x = x.view(batch_size, self.in_channels, self.H, self.W)  # (B, 4, 8, 8)
+
+      # --- Encoder Block 1 ---
+      x = self.enc1(x)  # (B, base_channels, 8, 8)
+      cond1 = self.time_proj_enc1(t_emb) + self.class_proj_enc1(c_emb)  # (B, base_channels)
+      cond1 = cond1.view(batch_size, -1, 1, 1)
+      x = x + cond1
+
+      # --- Encoder Block 2 (Downsampling) ---
+      x = self.enc2(x)  # (B, base_channels*2, 4, 4)
+      cond2 = self.time_proj_enc2(t_emb) + self.class_proj_enc2(c_emb)  # (B, base_channels*2)
+      cond2 = cond2.view(batch_size, -1, 1, 1)
+      x = x + cond2
+
+      # --- Bottleneck ---
+      x = self.bottleneck(x)  # (B, base_channels*2, 4, 4)
+      cond_b = self.time_proj_bottleneck(t_emb) + self.class_proj_bottleneck(c_emb)
+      cond_b = cond_b.view(batch_size, -1, 1, 1)
+      x = x + cond_b
+
+      # --- Decoder Block 1 (Upsampling) ---
+      x = self.dec1(x)  # (B, base_channels, 8, 8)
+      cond_d1 = self.time_proj_dec1(t_emb) + self.class_proj_dec1(c_emb)
+      cond_d1 = cond_d1.view(batch_size, -1, 1, 1)
+      x = x + cond_d1
+
+      # --- Decoder Block 2 (Refinement) ---
+      x = self.dec2(x)  # (B, in_channels, 8, 8)
+
+      # Project the refined feature map back to a latent vector
+      x = x.view(batch_size, -1)  # (B, in_channels * H * W)
+      out = self.project_out(x)   # (B, latent_dim)
+
+      # Residual connection from input to output scaled by a learnable parameter
+      out = out + self.res_ratio * z
+
+      return out
 
 class ConditionalDenoiseDiffusion():
     def __init__(self, eps_model, n_steps=1000, device=None):
@@ -923,9 +1001,9 @@ class Discriminator64(nn.Module):
 # Training Functions
 # -----------------------------
 def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
-                      lambda_cls=0.1, lambda_center=0.05, lambda_vgg=0.4, lambda_gan=0.12,
+                      lambda_cls=0.1, lambda_center=0.05, lambda_vgg=0.4, lambda_gan=0.3,
                       kl_weight_start=0.005, kl_weight_end=0.01,
-                      visualize_every=10, save_dir="./results"):
+                      visualize_every=10, save_dir="./results", start_epoch=0):
     print("Starting VAE-GAN training with perceptual loss enhancement...")
     os.makedirs(save_dir, exist_ok=True)
     device = next(autoencoder.parameters()).device
@@ -947,7 +1025,7 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
     best_loss = float('inf')
     lambda_recon = 1.0
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, start_epoch + num_epochs):
         autoencoder.train()
         discriminator.train()
 
@@ -1073,6 +1151,10 @@ def train_autoencoder(autoencoder, train_loader, num_epochs=300, lr=1e-4,
         if (epoch + 1) % visualize_every == 0 or epoch == num_epochs - 1:
             visualize_reconstructions(autoencoder, epoch + 1, save_dir)
             visualize_latent_space(autoencoder, epoch + 1, save_dir)
+            torch.save({
+                'autoencoder': autoencoder.state_dict(),
+                'discriminator': discriminator.state_dict(),
+            }, f"{save_dir}/vae_gan_epoch_{epoch + 1}.pt")
 
     torch.save({
         'autoencoder': autoencoder.state_dict(),
@@ -1166,7 +1248,7 @@ def train_conditional_diffusion(autoencoder, unet, train_loader, num_epochs=100,
     print(f"Saved final diffusion model after {start_epoch + num_epochs} epochs")
     return unet, diffusion, loss_history
 
-def main(checkpoint_path=None, total_epochs=2000):
+def main(checkpoint_path=None, vae_checkpoint_path=None, total_epochs=2000):
     print("Starting class-conditional diffusion model for STL10 Cat/Dog with improved architecture")
     device = torch.device(
         "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -1180,7 +1262,34 @@ def main(checkpoint_path=None, total_epochs=2000):
     autoencoder_path = f"{results_dir}/vae_gan_final.pt"
     diffusion_path = f"{results_dir}/conditional_diffusion_final.pt"
     autoencoder = SimpleAutoencoder(in_channels=3, latent_dim=256, num_classes=2).to(device)
-    if os.path.exists(autoencoder_path):
+    discriminator = Discriminator64().to(device)
+    if vae_checkpoint_path and os.path.exists(vae_checkpoint_path):
+        try:
+            filename = os.path.basename(vae_checkpoint_path)
+            epoch_str = filename.split("epoch_")[1].split(".pt")[0]
+            start_epoch = int(epoch_str)
+            print(f"Continuing training from epoch {start_epoch}")
+            checkpoint = torch.load(vae_checkpoint_path, map_location=device)
+            autoencoder.load_state_dict(checkpoint['autoencoder'], strict=False)
+            discriminator.load_state_dict(checkpoint['discriminator'], strict=False)
+        except (IndexError, ValueError) as e:
+            print(f"Could not extract epoch number from checkpoint filename: {e}")
+            print("Starting from epoch 0")
+            start_epoch = 0
+        autoencoder, discriminator, ae_losses = train_autoencoder(
+            autoencoder,
+            train_loader,
+            num_epochs=10000 - start_epoch,
+            lr=1e-3,
+            lambda_cls=0.0,
+            lambda_center=0.0,
+            lambda_vgg=0.8,
+            visualize_every=100,
+            save_dir=results_dir,
+            start_epoch=start_epoch
+        )
+        torch.save(autoencoder.state_dict(), autoencoder_path)
+    elif os.path.exists(autoencoder_path):
         print(f"Loading existing autoencoder from {autoencoder_path}")
         checkpoint = torch.load(autoencoder_path, map_location=device)
         autoencoder.load_state_dict(checkpoint['autoencoder'], strict=False)
@@ -1191,10 +1300,10 @@ def main(checkpoint_path=None, total_epochs=2000):
             autoencoder,
             train_loader,
             num_epochs=10000,
-            lr=5e-4,
+            lr=1e-3,
             lambda_cls=0.0,
             lambda_center=0.0,
-            lambda_vgg=0.6,
+            lambda_vgg=0.8,
             visualize_every=100,
             save_dir=results_dir
         )
@@ -1212,12 +1321,7 @@ def main(checkpoint_path=None, total_epochs=2000):
         plt.grid(True)
         plt.savefig(f"{results_dir}/autoencoder_losses.png")
         plt.close()
-    conditional_unet = ConditionalUNet(
-        latent_dim=256,
-        hidden_dims=[256, 512, 1024, 512, 256],
-        time_emb_dim=256,
-        num_classes=2
-    ).to(device)
+    conditional_unet = ConditionalUNet(latent_dim=256, time_emb_dim=256, num_classes=2, base_channels=64).to(device)
     def init_weights(m):
         if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
             nn.init.kaiming_normal_(m.weight, a=0.2)
@@ -1304,4 +1408,4 @@ def main(checkpoint_path=None, total_epochs=2000):
         print(f"  - {class_names[i]}: {path}")
 
 if __name__ == "__main__":
-    main(total_epochs=10000)
+    main(total_epochs=10000, vae_checkpoint_path="/content/drive/MyDrive/stl10_catdog_conditional_improved2/vae_gan_best_epoch_5900.pt")
