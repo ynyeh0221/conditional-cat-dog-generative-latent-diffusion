@@ -4,7 +4,7 @@ LatentDiffuPet: VAE-Enhanced Animal Generation is a deep learning project that c
 
 The project showcases advanced deep learning techniques including channel attention mechanisms, center loss for improved class separation, and optimized training with separate pathways for reconstruction and classification. The codebase includes comprehensive visualization tools that provide fascinating insights into the latent space structure and the step-by-step denoising process, demonstrating how diffusion models can operate efficiently in compressed latent spaces rather than directly in pixel space.
 
-[DEEPWIKI](https://deepwiki.com/ynyeh0221/conditional-cat-dog-generative-latent-diffusion)
+[DEEPWIKI](https://deepwiki.com/ynyeh0221/conditional-cat-dog-generative-latent-diffusion)[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ynyeh0221/conditional-cat-dog-generative-latent-diffusion)
 
 ## STL-10
 
